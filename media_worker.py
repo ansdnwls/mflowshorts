@@ -159,6 +159,8 @@ def run(task):
 if __name__=='__main__':
     import signal
     def time_limit(signum,frame): raise MediaError('timeout','작업 시간 제한을 초과했습니다. 부분 다운로드를 정상 완료로 처리하지 않았습니다.')
+    for stream in (sys.stdin,sys.stdout,sys.stderr):  # Windows defaults to a legacy code page
+        if hasattr(stream,'reconfigure'): stream.reconfigure(encoding='utf-8',errors='replace')
     if hasattr(signal,'SIGALRM'):  # Not on Windows; app.py's subprocess timeout still applies there.
         signal.signal(signal.SIGALRM,time_limit)
         signal.alarm(235)

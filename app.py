@@ -234,7 +234,7 @@ def run_media_job(job_id, task):
     with connect() as con:con.execute("UPDATE media_jobs SET status='running',message='플랫폼 연결 및 작업 실행 중',updated_at=? WHERE id=?",(now(),job_id))
     outcome={}
     try:
-        process=subprocess.run([str(MEDIA_PYTHON),str(ROOT/'media_worker.py')],input=json.dumps(task),text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=240)
+        process=subprocess.run([str(MEDIA_PYTHON),str(ROOT/'media_worker.py')],input=json.dumps(task),text=True,encoding='utf-8',errors='replace',stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=240)
         outcome=json.loads(process.stdout)
         if not isinstance(outcome,dict): outcome={};raise ValueError('잘못된 작업 응답')
         if not outcome.get('ok'): raise ValueError(outcome.get('message') or '작업 실패')
