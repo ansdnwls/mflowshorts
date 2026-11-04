@@ -63,8 +63,13 @@ def store(p):
 def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'fill'}
 
 
-# 720x1280 canvas: title band on top, caption area at the bottom, video in between.
-WIDTH,HEIGHT,TITLE_HEIGHT,CAPTION_TOP=720,1280,230,1060
+# 1080x1920 canvas: title band on top, caption area at the bottom, video in between.
+# Every size below was designed on a 720x1280 canvas and is scaled by SCALE (1.5) so the look stays the same.
+SCALE=1.5
+def px(value):return round(value*SCALE)
+WIDTH,HEIGHT,TITLE_HEIGHT,CAPTION_TOP=px(720),px(1280),px(230),px(1060)
+TITLE_FONT,TITLE_Y,TITLE_SPACING=px(38),px(65),px(10)
+CAPTION_FONT,CAPTION_Y,CAPTION_SPACING,CAPTION_PADDING=px(30),px(1080),px(8),px(12)
 LAYOUTS={'fill':'화면 꽉 채우기','fit':'원본 맞추기'}
 
 
@@ -76,7 +81,7 @@ def layout_filters(layout):
     """
     if layout=='fit':
         area=CAPTION_TOP-TITLE_HEIGHT
-        return [f'split[bg][fg];[bg]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},boxblur=20:2,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.45:t=fill[back];'
+        return [f'split[bg][fg];[bg]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},boxblur={px(20)}:2,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.45:t=fill[back];'
                 f'[fg]scale={WIDTH}:{area}:force_original_aspect_ratio=decrease,setsar=1[front];[back][front]overlay=x=(W-w)/2:y={TITLE_HEIGHT}+({area}-h)/2','setsar=1']
     area=HEIGHT-TITLE_HEIGHT
     return [f'scale={WIDTH}:{area}:force_original_aspect_ratio=increase',f'crop={WIDTH}:{area}','setsar=1',f'pad={WIDTH}:{HEIGHT}:0:{TITLE_HEIGHT}:black']
@@ -228,7 +233,7 @@ def render(p):
         style=STYLES[cfg['style']];title=run/'headline.txt';title.write_text('\n'.join(textwrap.wrap(doc['headline'],18)),encoding='utf-8')
         vf=layout_filters(cfg.get('layout','fill'))
         if cfg['mirror']:vf.append('hflip')
-        vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"drawtext=fontfile={filter_path(FONT)}:textfile={filter_path(title)}:expansion=none:fontcolor={style['title']}:fontsize=38:x=(w-text_w)/2:y=65:line_spacing=10"])
+        vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"drawtext=fontfile={filter_path(FONT)}:textfile={filter_path(title)}:expansion=none:fontcolor={style['title']}:fontsize={TITLE_FONT}:x=(w-text_w)/2:y={TITLE_Y}:line_spacing={TITLE_SPACING}"])
         chunks=textwrap.wrap(re.sub(r'\s+',' ',doc['script']),38)
         srt=[]
         for index,chunk in enumerate(chunks):
@@ -236,13 +241,13 @@ def render(p):
             srt.extend([str(index+1),f'{srt_time(start)} --> {srt_time(end)}','\n'.join(textwrap.wrap(chunk,19)),''])
             if cfg['captions']:
                 text=run/f'caption-{index}.txt';text.write_text('\n'.join(textwrap.wrap(chunk,19)),encoding='utf-8')
-                vf.append(f"drawtext=fontfile={filter_path(FONT)}:textfile={filter_path(text)}:expansion=none:fontcolor={style['caption']}:fontsize=30:box=1:boxcolor=black@0.8:boxborderw=12:x=(w-text_w)/2:y=1080:line_spacing=8:enable='gte(t,{start:.6f})*lt(t,{end:.6f})'")
+                vf.append(f"drawtext=fontfile={filter_path(FONT)}:textfile={filter_path(text)}:expansion=none:fontcolor={style['caption']}:fontsize={CAPTION_FONT}:box=1:boxcolor=black@0.8:boxborderw={CAPTION_PADDING}:x=(w-text_w)/2:y={CAPTION_Y}:line_spacing={CAPTION_SPACING}:enable='gte(t,{start:.6f})*lt(t,{end:.6f})'")
         (run/'captions.srt').write_text('\n'.join(srt),encoding='utf-8')
         output=run/'short.mp4'
         command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-ss',str(cfg['start']),'-threads','2','-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source),'-t',str(duration),'-map','0:v:0']
         if not cfg['mute']:command+=['-map','0:a:0?']
         command+=['-vf',','.join(vf),'-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
-        subprocess.run(command,capture_output=True,timeout=240,check=True)
+        subprocess.run(command,capture_output=True,timeout=480,check=True)
         result=probe(output)
         if result['width']!=WIDTH or result['height']!=HEIGHT:raise ValueError('render size')
         manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','approved_hash':doc['approved_hash']}

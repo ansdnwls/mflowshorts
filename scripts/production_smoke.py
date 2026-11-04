@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory() as directory:
             project=state['projects'][0];ident=project['id']
             assert project['status']=='completed'
             assert state['channels'][0]['template']['style']=='news'
-            assert project['document']['render_info']['width']==720 and project['document']['render_info']['height']==1280
+            assert project['document']['render_info']['width']==1080 and project['document']['render_info']['height']==1920
             assert project['document']['render_info']['audio']
             asset=BASE+'/api/production/asset?id='+ident+'&kind=output'
             with urllib.request.urlopen(urllib.request.Request(asset,headers={'Range':'bytes=0-9'})) as response:
