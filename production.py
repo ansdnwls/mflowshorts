@@ -128,7 +128,7 @@ def update_project(data):
 
 def probe(path):
     try:
-        result=subprocess.run(['ffprobe','-v','error','-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-show_format','-show_streams','-of','json',str(path)],capture_output=True,text=True,timeout=20,check=True)
+        result=subprocess.run(['ffprobe','-v','error','-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-show_format','-show_streams','-of','json',str(path)],capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=20,check=True)
         info=json.loads(result.stdout);duration=float(info['format']['duration'])
         if not set(info['format'].get('format_name','').split(','))&set(SOURCE_FORMATS.split(',')):raise ValueError('unsupported format')
         stream=next(s for s in info['streams'] if s.get('codec_type')=='video')

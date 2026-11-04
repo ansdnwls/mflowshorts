@@ -78,3 +78,9 @@ class ProductionTests(unittest.TestCase):
     def test_filter_path_escapes_windows_paths(self):
         self.assertEqual(production.filter_path('D:\\프로젝트\\font.ttf'),"'D\\:/프로젝트/font.ttf'")
         with self.assertRaises(ValueError):production.filter_path("/tmp/it's")
+    def test_probe_decodes_output_as_utf8(self):
+        out='{"format":{"duration":"3","format_name":"mov,mp4"},"streams":[{"codec_type":"video","width":640,"height":360}]}'
+        with patch.object(production.subprocess,'run',return_value=production.subprocess.CompletedProcess([],0,stdout=out)) as run:
+            self.assertEqual(production.probe('x')['width'],640)
+        self.assertEqual(run.call_args.kwargs['encoding'],'utf-8')
+
