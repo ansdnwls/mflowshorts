@@ -54,3 +54,27 @@ class ProductionTests(unittest.TestCase):
         self.assertIn('실제 맥락과 새 해석',doc['context'])
         self.assertEqual(doc['script'],'')
         self.assertIsNone(doc['approved_hash'])
+
+    def test_unexpected_render_error_is_recoverable(self):
+        self.add_source();production.update_project({'id':self.ident,'script':'대본'});production.approve(self.ident)
+        with patch.object(production,'state',return_value={'render_available':True}),patch.object(production.threading,'Thread') as thread:
+            production.start_render(self.ident)
+        p=thread.call_args.kwargs['args'][0]
+        with patch.object(production,'STYLES',{}),patch('traceback.print_exc'):production.render(p)
+        self.assertEqual(production.project(self.ident)['status'],'error')
+        self.assertFalse(production.LOCK.locked())
+        self.assertEqual([x for x in (production.PROJECT_ROOT/self.ident).iterdir() if x.is_dir()],[])
+        production.update_project({'id':self.ident,'script':'수정한 대본'})
+    def test_headline_must_fit_three_lines(self):
+        with self.assertRaises(ValueError):production.update_project({'id':self.ident,'headline':'가'*55})
+        production.update_project({'id':self.ident,'headline':'가'*54})
+        long_id=production.create_project({'title':'긴 제목 '*20,'channel_id':self.channel})
+        production.update_project({'id':long_id,'script':'대본'})
+    def test_upload_does_not_block_other_edits(self):
+        def slow_probe(path):
+            self.assertFalse(production.CONFIG_LOCK._is_owned())
+            return {'duration':20,'width':1920,'height':1080,'audio':True}
+        with patch.object(production,'probe',side_effect=slow_probe):production.upload(self.ident,io.BytesIO(b'source'),6)
+    def test_filter_path_escapes_windows_paths(self):
+        self.assertEqual(production.filter_path('D:\\프로젝트\\font.ttf'),"'D\\:/프로젝트/font.ttf'")
+        with self.assertRaises(ValueError):production.filter_path("/tmp/it's")

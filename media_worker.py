@@ -82,7 +82,9 @@ def tiktok_search(task):
     items={}
     with sync_playwright() as p:
         proxy=os.environ.get('HTTPS_PROXY')
-        options={'headless':True,'executable_path':os.environ.get('CHROMIUM_PATH','/usr/bin/chromium'),'args':['--no-sandbox']}
+        options={'headless':True,'args':['--no-sandbox']}
+        chromium=os.environ.get('CHROMIUM_PATH') or ('/usr/bin/chromium' if Path('/usr/bin/chromium').is_file() else None)
+        if chromium: options['executable_path']=chromium
         if proxy: options['proxy']={'server':proxy,'bypass':'localhost,127.0.0.1'}
         browser=p.chromium.launch(**options)
         context=browser.new_context(locale='en-US')
@@ -157,8 +159,9 @@ def run(task):
 if __name__=='__main__':
     import signal
     def time_limit(signum,frame): raise MediaError('timeout','작업 시간 제한을 초과했습니다. 부분 다운로드를 정상 완료로 처리하지 않았습니다.')
-    signal.signal(signal.SIGALRM,time_limit)
-    signal.alarm(235)
+    if hasattr(signal,'SIGALRM'):  # Not on Windows; app.py's subprocess timeout still applies there.
+        signal.signal(signal.SIGALRM,time_limit)
+        signal.alarm(235)
     output={}
     try:
         task=json.loads(sys.stdin.read())

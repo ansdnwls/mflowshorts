@@ -13,6 +13,7 @@ import production
 import os
 import sqlite3
 import threading
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,15 +27,23 @@ KST = dt.timezone(dt.timedelta(hours=9))
 SCAN_LOCK = threading.Lock()
 MEDIA_LOCK = threading.Lock()
 MEDIA_ROOT = ROOT / 'data/downloads'
-MEDIA_PYTHON = Path(os.environ.get('MFLOW_MEDIA_PYTHON',ROOT / 'data/media-venv/bin/python'))
+MEDIA_PYTHON = Path(os.environ.get('MFLOW_MEDIA_PYTHON',ROOT / ('data/media-venv/Scripts/python.exe' if os.name=='nt' else 'data/media-venv/bin/python')))
+LOCAL_HOSTS = {'127.0.0.1','localhost','::1'}
+
+class ClosingConnection(sqlite3.Connection):
+    """Commit or roll back like sqlite3, then also close the connection."""
+    def __exit__(self, *exc):
+        try: return super().__exit__(*exc)
+        finally: self.close()
 
 def connect():
     DB.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB)
+    con = sqlite3.connect(DB, timeout=15, factory=ClosingConnection)
     con.row_factory = sqlite3.Row
     return con
 
 def init():
+    with connect() as con: con.execute('PRAGMA journal_mode=WAL')
     production.init(connect)
     with connect() as con:
         con.executescript('''CREATE TABLE IF NOT EXISTS videos (
@@ -227,6 +236,7 @@ def run_media_job(job_id, task):
     try:
         process=subprocess.run([str(MEDIA_PYTHON),str(ROOT/'media_worker.py')],input=json.dumps(task),text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=240)
         outcome=json.loads(process.stdout)
+        if not isinstance(outcome,dict): outcome={};raise ValueError('잘못된 작업 응답')
         if not outcome.get('ok'): raise ValueError(outcome.get('message') or '작업 실패')
         result=outcome.get('result',{})
         video_ids=[save_external_video(video) for video in result.pop('videos',[])[:10]]
@@ -234,11 +244,14 @@ def run_media_job(job_id, task):
         message=f'{len(video_ids)}개 영상의 공개 정보를 저장했습니다.' if task['action']!='hot' else f"더우인 인기 검색어 {len(result.get('trends',[]))}개를 가져왔습니다."
         if task['action']=='download':message='영상 다운로드가 완료되었습니다.'
         with connect() as con:con.execute("UPDATE media_jobs SET status='success',message=?,result=?,updated_at=? WHERE id=?",(message,json.dumps(result,ensure_ascii=False),now(),job_id))
-    except (ValueError,subprocess.TimeoutExpired,OSError,KeyError,TypeError):
+    except Exception as exc:
+        if not isinstance(exc,(ValueError,subprocess.TimeoutExpired,OSError,KeyError,TypeError)): traceback.print_exc()
         code=outcome.get('code') or 'tool_error'
         message=outcome.get('message') or '작업이 시간 내 완료되지 않았거나 응답을 읽지 못했습니다. 설치 상태와 플랫폼 접근 조건을 확인하세요.'
         shutil.rmtree(directory,ignore_errors=True)
-        with connect() as con:con.execute("UPDATE media_jobs SET status='error',code=?,message=?,updated_at=? WHERE id=?",(code,message,now(),job_id))
+        try:
+            with connect() as con:con.execute("UPDATE media_jobs SET status='error',code=?,message=?,updated_at=? WHERE id=?",(code,message,now(),job_id))
+        except sqlite3.Error: traceback.print_exc()
 
 
 def analyze_channel(channel_id):
@@ -273,19 +286,32 @@ def scheduler():
             if config['schedule']=='true' and now.hour >= int(config['hour_kst']):
                 with connect() as con:
                     last = con.execute("SELECT value FROM settings WHERE key='scheduled_date'").fetchone()
-                if not last or last[0] != now.date().isoformat():
+                if (not last or last[0] != now.date().isoformat()) and not SCAN_LOCK.locked():
                     with connect() as con: con.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('scheduled_date',now.date().isoformat()))
                     try: scan()
                     except ValueError: pass
         except Exception:
-            pass
+            traceback.print_exc()
         threading.Event().wait(30)
 
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, value, status=200):
         body = json.dumps(value,ensure_ascii=False).encode()
         self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+    def local_request(self):
+        # Blocks DNS-rebinding pages: the browser must address this server as localhost.
+        host = urllib.parse.urlsplit('//'+(self.headers.get('Host') or '')).hostname
+        return host in LOCAL_HOSTS
+    def fail(self, exc):
+        traceback.print_exc()
+        try: self.send_json({'error':'서버 내부 오류가 발생했습니다. 잠시 후 다시 시도하세요.'},500)
+        except OSError: pass
     def do_GET(self):
+        if not self.local_request(): return self.send_error(403)
+        try: self.route_get()
+        except (BrokenPipeError,ConnectionResetError): pass
+        except Exception as exc: self.fail(exc)
+    def route_get(self):
         if self.path == '/api/production/state': return self.send_json(production.state())
         if self.path.startswith('/api/production/asset?'):
             query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -348,6 +374,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header('Content-Type',{'html':'text/html; charset=utf-8','js':'text/javascript; charset=utf-8','css':'text/css'}[name.split('.')[-1]]); self.end_headers(); self.wfile.write(body)
     def do_POST(self):
         # Accept only local same-origin browser requests; keys never reach the browser.
+        if not self.local_request(): return self.send_json({'error':'허용되지 않은 요청입니다.'},403)
         origin = self.headers.get('Origin')
         if origin and urllib.parse.urlsplit(origin).netloc != self.headers.get('Host'): return self.send_json({'error':'허용되지 않은 요청입니다.'},403)
         try:
@@ -398,15 +425,19 @@ class Handler(BaseHTTPRequestHandler):
                     con.execute('INSERT OR REPLACE INTO research VALUES (?,?,?,?,?,?)',(video_id,saved,source_url,attribution,notes,status))
                 return self.send_json({'message':'추적 메모를 저장했습니다.'})
             if self.path == '/api/settings':
-                config = {k:str(data[k]) for k in ('queries','days','min_views','hour_kst','schedule')}
+                if any(k not in data for k in ('queries','days','min_views','hour_kst','schedule')): raise ValueError('검색어·기간·최소 조회수·수집 시각·자동 수집 값을 모두 입력하세요.')
+                config = {k:str(data[k]).strip() for k in ('queries','days','min_views','hour_kst','schedule')}
                 config['region'] = str(data.get('region','ALL'))
                 if config['region'] not in ('ALL','KR','US','TW','JP'): raise ValueError('지원하지 않는 검색 지역입니다.')
                 if not config['queries'].strip() or len(config['queries'])>500: raise ValueError('검색어를 입력하세요. 최대 500자입니다.')
+                if not all(re.fullmatch(r'[0-9]{1,13}',config[k]) for k in ('days','min_views','hour_kst')): raise ValueError('기간·최소 조회수·수집 시각은 숫자로 입력하세요.')
                 if not 1 <= int(config['days']) <= 14 or not 0 <= int(config['min_views']) <= 10**12 or not 0 <= int(config['hour_kst']) <= 23 or config['schedule'] not in ('true','false'): raise ValueError('필터 설정을 확인하세요.')
                 with connect() as con: con.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)',config.items())
                 return self.send_json({'message':'설정을 저장했습니다.'})
             self.send_error(404)
         except (ValueError,KeyError,TypeError) as exc: self.send_json({'error':str(exc)},400)
+        except (BrokenPipeError,ConnectionResetError): pass
+        except Exception as exc: self.fail(exc)
 
 def main():
     init()
