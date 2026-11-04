@@ -300,6 +300,9 @@ def source_comments(project_id):
         token = page.get('nextPageToken')
         if not token: break
     result = comment_picker.from_youtube(items)
+    if not doc.get('credit'):  # 1 more quota unit, only while the credit line is empty
+        info = youtube('videos', {'part':'snippet','id':video_id}).get('items',[])
+        result['credit'] = production.credit_line(info[0]['snippet'].get('channelTitle')) if info else ''
     if not result['comments']: raise ValueError('카드로 쓸 만한 공개 댓글을 찾지 못했어요. 댓글 카드는 직접 입력하세요.')
     return result
 

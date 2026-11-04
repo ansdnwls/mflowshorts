@@ -158,6 +158,12 @@ def create_channel(data):
     return ident
 
 
+def credit_line(channel):
+    """Default credit under the title: '출처. 채널명' (60 characters at most)."""
+    name=re.sub(r'\s+',' ',str(channel or '')).strip()
+    return ('출처. '+name)[:60].rstrip() if name and name not in ('작성자 미제공',) else ''
+
+
 @serialized
 def create_project(data):
     title=str(data.get('title','')).strip();channel_id=str(data.get('channel_id',''))
@@ -170,10 +176,11 @@ def create_project(data):
     doc={'settings':settings(json.loads(channel['template'])),'script':'','headline':headline,'source':None,'approved_hash':None,'message':'원본 영상을 업로드하세요.','source_url':'','context':''}
     if data.get('source_video_id'):
         with CONNECT() as con:
-            video=con.execute('SELECT url FROM videos WHERE id=?',(str(data['source_video_id']),)).fetchone()
+            video=con.execute('SELECT url,channel FROM videos WHERE id=?',(str(data['source_video_id']),)).fetchone()
             note=con.execute('SELECT notes,attribution FROM research WHERE video_id=?',(str(data['source_video_id']),)).fetchone()
         if not video:raise ValueError('발굴한 영상을 찾을 수 없습니다.')
         doc['source_url']=video['url']
+        doc['credit']=credit_line(video['channel'])
         doc['context']=((note['attribution']+'\n'+note['notes']).strip() if note else '')[:2000]
         doc['source_video_id']=str(data['source_video_id'])
     with CONNECT() as con:con.execute('INSERT INTO production_projects VALUES (?,?,?,?,?,?,?)',(ident,title,channel_id,'draft',json.dumps(doc,ensure_ascii=False),now(),now()))
