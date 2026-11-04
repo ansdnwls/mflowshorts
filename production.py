@@ -60,7 +60,26 @@ def store(p):
     with CONNECT() as con: con.execute('UPDATE production_projects SET title=?,channel_id=?,status=?,document=?,updated_at=? WHERE id=?',(p['title'],p['channel_id'],p['status'],json.dumps(p['document'],ensure_ascii=False),now(),p['id']))
 
 
-def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True}
+def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'fill'}
+
+
+# 720x1280 canvas: title band on top, caption area at the bottom, video in between.
+WIDTH,HEIGHT,TITLE_HEIGHT,CAPTION_TOP=720,1280,230,1060
+LAYOUTS={'fill':'화면 꽉 채우기','fit':'원본 맞추기'}
+
+
+def layout_filters(layout):
+    """Video filters that place the source on the canvas without the title band hiding it.
+
+    fill: crop the source to cover everything below the title band (captions sit on the video).
+    fit: show the whole source between the title and caption areas, over a blurred copy of itself.
+    """
+    if layout=='fit':
+        area=CAPTION_TOP-TITLE_HEIGHT
+        return [f'split[bg][fg];[bg]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},boxblur=20:2,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.45:t=fill[back];'
+                f'[fg]scale={WIDTH}:{area}:force_original_aspect_ratio=decrease,setsar=1[front];[back][front]overlay=x=(W-w)/2:y={TITLE_HEIGHT}+({area}-h)/2','setsar=1']
+    area=HEIGHT-TITLE_HEIGHT
+    return [f'scale={WIDTH}:{area}:force_original_aspect_ratio=increase',f'crop={WIDTH}:{area}','setsar=1',f'pad={WIDTH}:{HEIGHT}:0:{TITLE_HEIGHT}:black']
 
 
 def settings(data):
@@ -68,7 +87,7 @@ def settings(data):
     try:result['duration']=float(result['duration']);result['start']=float(result['start'])
     except (ValueError,TypeError):raise ValueError('영상 길이와 시작 시간을 확인하세요.') from None
     if not math.isfinite(result['duration']) or not 1<=result['duration']<=60 or not math.isfinite(result['start']) or not 0<=result['start']<=5400:raise ValueError('길이는 1~60초, 시작은 0~5400초입니다.')
-    if result['style'] not in STYLES or any(type(result[k]) is not bool for k in ('mute','mirror','captions')):raise ValueError('스타일 설정을 확인하세요.')
+    if result['style'] not in STYLES or result['layout'] not in LAYOUTS or any(type(result[k]) is not bool for k in ('mute','mirror','captions')):raise ValueError('스타일 설정을 확인하세요.')
     return result
 
 
@@ -207,9 +226,9 @@ def render(p):
         run.mkdir(parents=True)
         source=directory/doc['source']['filename'];cfg=doc['settings'];duration=min(cfg['duration'],doc['source']['duration']-cfg['start'])
         style=STYLES[cfg['style']];title=run/'headline.txt';title.write_text('\n'.join(textwrap.wrap(doc['headline'],18)),encoding='utf-8')
-        vf=['scale=720:960:force_original_aspect_ratio=decrease','pad=720:1280:(ow-iw)/2:(oh-ih)/2:black','setsar=1']
+        vf=layout_filters(cfg.get('layout','fill'))
         if cfg['mirror']:vf.append('hflip')
-        vf.extend(['drawbox=x=0:y=0:w=iw:h=230:color=black:t=fill',f"drawtext=fontfile={filter_path(FONT)}:textfile={filter_path(title)}:expansion=none:fontcolor={style['title']}:fontsize=38:x=(w-text_w)/2:y=65:line_spacing=10"])
+        vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"drawtext=fontfile={filter_path(FONT)}:textfile={filter_path(title)}:expansion=none:fontcolor={style['title']}:fontsize=38:x=(w-text_w)/2:y=65:line_spacing=10"])
         chunks=textwrap.wrap(re.sub(r'\s+',' ',doc['script']),38)
         srt=[]
         for index,chunk in enumerate(chunks):
@@ -225,7 +244,7 @@ def render(p):
         command+=['-vf',','.join(vf),'-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
         subprocess.run(command,capture_output=True,timeout=240,check=True)
         result=probe(output)
-        if result['width']!=720 or result['height']!=1280:raise ValueError('render size')
+        if result['width']!=WIDTH or result['height']!=HEIGHT:raise ValueError('render size')
         manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','approved_hash':doc['approved_hash']}
         (run/'project.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
         with zipfile.ZipFile(run/'project.zip','w',compression=zipfile.ZIP_STORED) as archive:

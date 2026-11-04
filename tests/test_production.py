@@ -37,6 +37,14 @@ class ProductionTests(unittest.TestCase):
     def test_nonfinite_settings_rejected(self):
         for key,value in [('duration',float('nan')),('start',float('inf')),('duration',1000),('mirror','true')]:
             with self.subTest(key=key),self.assertRaises(ValueError):production.settings({key:value})
+    def test_layout_setting(self):
+        self.assertEqual(production.settings({})['layout'],'fill')
+        self.assertEqual(production.settings({'layout':'fit'})['layout'],'fit')
+        with self.assertRaises(ValueError):production.settings({'layout':'stretch'})
+    def test_layout_keeps_video_clear_of_title_band(self):
+        fill=','.join(production.layout_filters('fill'));fit=','.join(production.layout_filters('fit'))
+        self.assertIn(f'pad=720:1280:0:{production.TITLE_HEIGHT}',fill)
+        self.assertIn(f'scale=720:{production.CAPTION_TOP-production.TITLE_HEIGHT}:force_original_aspect_ratio=decrease',fit)
     def test_rendering_project_cannot_be_edited(self):
         p=production.project(self.ident);p['status']='rendering';production.store(p)
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'script':'edit'})
