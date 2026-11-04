@@ -47,7 +47,7 @@ class ProductionTests(unittest.TestCase):
         self.assertIn(f'scale=1080:{production.CAPTION_TOP-production.TITLE_HEIGHT}:force_original_aspect_ratio=decrease',fit)
     def test_subtitles_two_color_title_and_highlight(self):
         style=production.STYLES['basic']
-        with patch.object(production,'font_family',return_value='Test Font'):
+        with patch.object(production,'font_info',return_value=('Test Font',700)):
             ass,srt=production.subtitles({'headline':'상단 문구 첫 줄 둘째 줄은 미완결','script':'나레이션 *예시 문장* 입니다. 다음 문장'},style,10,True)
         title=next(line for line in ass.splitlines() if ',Title,' in line and line.startswith('Dialogue'))
         self.assertIn(production.ass_color(style['title'])+'}상단 문구 첫 줄',title)
@@ -57,10 +57,20 @@ class ProductionTests(unittest.TestCase):
         self.assertNotIn('*',srt)
         self.assertIn('나레이션 예시 문장',srt)
     def test_subtitle_text_cannot_inject_ass_tags(self):
-        with patch.object(production,'font_family',return_value='Test Font'):
+        with patch.object(production,'font_info',return_value=('Test Font',700)):
             ass,_=production.subtitles({'headline':'{\\pos(0,0)}제목','script':'대본'},production.STYLES['basic'],5,False)
         self.assertNotIn('{\\pos(0,0)}',ass)
         self.assertNotIn(',Caption,,',ass)
+    def test_custom_fonts_from_fonts_folder(self):
+        fonts=Path(self.temp.name)/'fonts';fonts.mkdir();(fonts/'Display.ttf').write_bytes(b'x');(fonts/'notes.txt').write_text('x')
+        with patch.object(production,'FONTS_DIR',fonts),patch.object(production,'font_info',return_value=('Display Font',400)):
+            self.assertEqual(production.available_fonts(),[{'file':'Display.ttf','name':'Display Font'}])
+            self.assertEqual(production.settings({'title_font':'Display.ttf'})['title_font'],'Display.ttf')
+            for bad in ('Missing.ttf','../db.sqlite','notes.txt',3):
+                with self.subTest(bad=bad),self.assertRaises(ValueError):production.settings({'caption_font':bad})
+            ass,_=production.subtitles({'headline':'제목','script':'대본'},production.STYLES['basic'],5,True,fonts/'Display.ttf',fonts/'Display.ttf')
+        self.assertIn('Style: Title,Display Font,',ass)
+        self.assertIn('&H00000000&,0,0,0,0,100',ass)  # regular-weight display font is not fake-bolded
     def test_rendering_project_cannot_be_edited(self):
         p=production.project(self.ident);p['status']='rendering';production.store(p)
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'script':'edit'})

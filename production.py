@@ -18,6 +18,11 @@ import traceback
 PROJECT_ROOT = Path(os.environ.get('MFLOW_PROJECT_ROOT',Path(__file__).parent/'data/projects'))
 FONT_CANDIDATES = ['/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc','C:/Windows/Fonts/malgunbd.ttf','/System/Library/Fonts/AppleSDGothicNeo.ttc']
 FONT = os.environ.get('MFLOW_FONT') or next((f for f in FONT_CANDIDATES if Path(f).is_file()),FONT_CANDIDATES[0])
+# Extra fonts the user drops in this folder (.ttf/.otf/.ttc) can be picked per project for the title and captions.
+# The folder is not in git because many free fonts do not allow redistribution.
+FONTS_DIR = Path(os.environ.get('MFLOW_FONTS_DIR',Path(__file__).parent/'fonts'))
+FONT_SUFFIXES = ('.ttf','.otf','.ttc')
+_FONT_CACHE = {}
 # Demuxers we accept for uploads. Playlist formats such as HLS can make FFmpeg read other local files.
 SOURCE_FORMATS = 'mov,mp4,m4a,3gp,3g2,mj2,matroska,webm'
 # title: first line of the headline, title2: the other lines, caption: narration text, highlight: words marked *like this* in the script.
@@ -51,7 +56,7 @@ def state():
         projects=[]
         for row in con.execute('SELECT * FROM production_projects ORDER BY updated_at DESC'):
             p=dict(row);p['document']=json.loads(p['document']);projects.append(p)
-    return {'channels':channels,'projects':projects,'styles':STYLES,'render_available':bool(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(FONT).is_file())}
+    return {'channels':channels,'projects':projects,'styles':STYLES,'fonts':available_fonts(),'render_available':bool(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(FONT).is_file())}
 
 
 def project(project_id):
@@ -64,7 +69,25 @@ def store(p):
     with CONNECT() as con: con.execute('UPDATE production_projects SET title=?,channel_id=?,status=?,document=?,updated_at=? WHERE id=?',(p['title'],p['channel_id'],p['status'],json.dumps(p['document'],ensure_ascii=False),now(),p['id']))
 
 
-def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'fill'}
+def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'fill','title_font':'','caption_font':''}
+
+
+def available_fonts():
+    """Fonts in FONTS_DIR as [{'file','name'}]. '' (not listed) means the default FONT."""
+    result=[]
+    if FONTS_DIR.is_dir():
+        for path in sorted(FONTS_DIR.iterdir()):
+            if path.suffix.lower() not in FONT_SUFFIXES or not path.is_file():continue
+            try:result.append({'file':path.name,'name':font_info(path)[0]})
+            except (ValueError,OSError,IndexError,__import__('struct').error):continue
+    return result
+
+
+def font_path(name):
+    if not name:return Path(FONT)
+    path=FONTS_DIR/name
+    if Path(name).name!=name or path.suffix.lower() not in FONT_SUFFIXES or not path.is_file():raise ValueError('글씨체 파일을 찾을 수 없습니다.')
+    return path
 
 
 # 1080x1920 canvas: title band on top, caption area at the bottom, video in between.
@@ -99,6 +122,8 @@ def settings(data):
     try:result['duration']=float(result['duration']);result['start']=float(result['start'])
     except (ValueError,TypeError):raise ValueError('영상 길이와 시작 시간을 확인하세요.') from None
     if not math.isfinite(result['duration']) or not 1<=result['duration']<=60 or not math.isfinite(result['start']) or not 0<=result['start']<=5400:raise ValueError('길이는 1~60초, 시작은 0~5400초입니다.')
+    fonts={f['file'] for f in available_fonts()}
+    if any(not isinstance(result[k],str) or (result[k] and result[k] not in fonts) for k in ('title_font','caption_font')):raise ValueError('글씨체를 다시 선택하세요. fonts 폴더에 파일이 있어야 합니다.')
     if result['style'] not in STYLES or result['layout'] not in LAYOUTS or any(type(result[k]) is not bool for k in ('mute','mirror','captions')):raise ValueError('스타일 설정을 확인하세요.')
     return result
 
@@ -227,22 +252,31 @@ def filter_path(path):
     return "'"+value.replace(':','\\:')+"'"
 
 
-def font_family(path):
-    """Read the family name from a TTF/OTF/TTC file so libass can pick it from fontsdir."""
+def font_info(path):
+    """(family name, weight) of a TTF/OTF/TTC file, cached by modification time."""
+    path=Path(path);key=(str(path),path.stat().st_mtime_ns)
+    if key not in _FONT_CACHE:_FONT_CACHE[key]=read_font_info(path)
+    return _FONT_CACHE[key]
+
+
+def read_font_info(path):
+    """Read the family name and weight from the font's name and OS/2 tables so libass can pick it from fontsdir."""
     import struct
     data=Path(path).read_bytes()
     offset=struct.unpack('>I',data[12:16])[0] if data[:4]==b'ttcf' else 0
-    tables=struct.unpack('>H',data[offset+4:offset+6])[0]
+    tables=struct.unpack('>H',data[offset+4:offset+6])[0];names={};weight=400
     for i in range(tables):
         tag,_,table,_=struct.unpack('>4sIII',data[offset+12+16*i:offset+28+16*i])
+        if tag==b'OS/2':weight=struct.unpack('>H',data[table+4:table+6])[0]
         if tag!=b'name':continue
-        _,count,strings=struct.unpack('>HHH',data[table:table+6]);names={}
+        _,count,strings=struct.unpack('>HHH',data[table:table+6])
         for j in range(count):
             platform,encoding,language,name_id,length,start=struct.unpack('>6H',data[table+6+12*j:table+18+12*j])
             if name_id==1 and platform==3 and encoding in (1,10):
                 names[language]=data[table+strings+start:table+strings+start+length].decode('utf-16-be',errors='ignore')
-        if names:return names.get(0x409) or next(iter(names.values()))
-    raise ValueError('font name')
+    family=(names.get(0x409) or next(iter(names.values()),'')).replace(',',' ').strip()
+    if not family:raise ValueError('font name')
+    return family,weight
 
 
 def ass_color(value):return '&H00'+value[5:7]+value[3:5]+value[1:3]+'&'
@@ -282,15 +316,21 @@ def caption_chunks(script):
     return chunks
 
 
-def subtitles(doc,style,duration,captions):
+def ass_font(path):
+    """Fontname and Bold flag for an ASS style. Only ask for bold when the file is bold, so display fonts are not fake-bolded."""
+    family,weight=font_info(path)
+    return family,-1 if weight>=600 else 0
+
+
+def subtitles(doc,style,duration,captions,title_font=None,caption_font=None):
     """Build the ASS subtitle file (headline + narration captions) and the matching SRT text."""
     lines,size=title_lines(doc['headline'])
     title=r'\N'.join(('{\\c'+ass_color(style['title' if i==0 else 'title2'])+'}')+ass_text(line) for i,line in enumerate(lines))
-    family=font_family(FONT)
+    title_family,title_bold=ass_font(title_font or FONT);caption_family,caption_bold=ass_font(caption_font or FONT)
     ass=['[Script Info]','ScriptType: v4.00+',f'PlayResX: {WIDTH}',f'PlayResY: {HEIGHT}','WrapStyle: 2','ScaledBorderAndShadow: yes','',
          '[V4+ Styles]','Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-         f'Style: Title,{family},{size},{ass_color(style["title"])},&H000000FF&,&H00000000&,&H00000000&,-1,0,0,0,100,100,0,0,1,{TITLE_OUTLINE},0,5,0,0,0,1',
-         f'Style: Caption,{family},{CAPTION_FONT},{ass_color(style["caption"])},&H000000FF&,&H00000000&,&H80000000&,-1,0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},{px(2)},2,0,0,0,1',
+         f'Style: Title,{title_family},{size},{ass_color(style["title"])},&H000000FF&,&H00000000&,&H00000000&,{title_bold},0,0,0,100,100,0,0,1,{TITLE_OUTLINE},0,5,0,0,0,1',
+         f'Style: Caption,{caption_family},{CAPTION_FONT},{ass_color(style["caption"])},&H000000FF&,&H00000000&,&H80000000&,{caption_bold},0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},{px(2)},2,0,0,0,1',
          '','[Events]','Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
          f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT//2})}}{title}']
     srt=[];chunks=caption_chunks(doc['script'])
@@ -321,8 +361,10 @@ def render(p):
         vf=layout_filters(cfg.get('layout','fill'))
         if cfg['mirror']:vf.append('hflip')
         # libass loads the font from its own folder, so it does not depend on the system font setup (fontconfig on Windows).
-        fonts=run/'fonts';fonts.mkdir();shutil.copyfile(FONT,fonts/Path(FONT).name)
-        ass,srt=subtitles(doc,style,duration,cfg['captions'])
+        title_font=font_path(cfg.get('title_font',''));caption_font=font_path(cfg.get('caption_font',''))
+        fonts=run/'fonts';fonts.mkdir()
+        for path in {title_font,caption_font}:shutil.copyfile(path,fonts/path.name)
+        ass,srt=subtitles(doc,style,duration,cfg['captions'],title_font,caption_font)
         (run/'overlay.ass').write_text(ass,encoding='utf-8')
         vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"ass=filename={filter_path(run/'overlay.ass')}:fontsdir={filter_path(fonts)}"])
         (run/'captions.srt').write_text(srt,encoding='utf-8')
@@ -347,6 +389,12 @@ def render(p):
         try:store(p)
         except Exception:traceback.print_exc()
     finally:LOCK.release()
+
+
+def font_file(name):
+    """A font from FONTS_DIR for the edit-screen preview."""
+    if not name or not any(f['file']==name for f in available_fonts()):raise ValueError('font')
+    return font_path(name)
 
 
 def asset(project_id,kind):

@@ -313,6 +313,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc: self.fail(exc)
     def route_get(self):
         if self.path == '/api/production/state': return self.send_json(production.state())
+        if self.path.startswith('/api/production/font?'):
+            query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try: path=production.font_file(query.get('file',[''])[0])
+            except ValueError: return self.send_error(404)
+            body=path.read_bytes()
+            self.send_response(200);self.send_header('Content-Type',{'.otf':'font/otf','.ttc':'font/collection'}.get(path.suffix.lower(),'font/ttf'));self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','max-age=3600');self.end_headers();self.wfile.write(body);return
         if self.path.startswith('/api/production/asset?'):
             query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             try: path=production.asset(query.get('id',[''])[0],query.get('kind',[''])[0])
