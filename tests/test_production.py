@@ -45,6 +45,22 @@ class ProductionTests(unittest.TestCase):
         fill=','.join(production.layout_filters('fill'));fit=','.join(production.layout_filters('fit'))
         self.assertIn(f'pad=1080:1920:0:{production.TITLE_HEIGHT}',fill)
         self.assertIn(f'scale=1080:{production.CAPTION_TOP-production.TITLE_HEIGHT}:force_original_aspect_ratio=decrease',fit)
+    def test_subtitles_two_color_title_and_highlight(self):
+        style=production.STYLES['basic']
+        with patch.object(production,'font_family',return_value='Test Font'):
+            ass,srt=production.subtitles({'headline':'상단 문구 첫 줄 둘째 줄은 미완결','script':'나레이션 *예시 문장* 입니다. 다음 문장'},style,10,True)
+        title=next(line for line in ass.splitlines() if ',Title,' in line and line.startswith('Dialogue'))
+        self.assertIn(production.ass_color(style['title'])+'}상단 문구 첫 줄',title)
+        self.assertIn(production.ass_color(style['title2'])+'}둘째 줄은 미완결',title)
+        self.assertIn(production.ass_color(style['highlight'])+'}예시',ass)
+        self.assertEqual(ass.count(',Caption,,'),2)
+        self.assertNotIn('*',srt)
+        self.assertIn('나레이션 예시 문장',srt)
+    def test_subtitle_text_cannot_inject_ass_tags(self):
+        with patch.object(production,'font_family',return_value='Test Font'):
+            ass,_=production.subtitles({'headline':'{\\pos(0,0)}제목','script':'대본'},production.STYLES['basic'],5,False)
+        self.assertNotIn('{\\pos(0,0)}',ass)
+        self.assertNotIn(',Caption,,',ass)
     def test_rendering_project_cannot_be_edited(self):
         p=production.project(self.ident);p['status']='rendering';production.store(p)
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'script':'edit'})

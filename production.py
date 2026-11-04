@@ -20,7 +20,11 @@ FONT_CANDIDATES = ['/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc','C:/Win
 FONT = os.environ.get('MFLOW_FONT') or next((f for f in FONT_CANDIDATES if Path(f).is_file()),FONT_CANDIDATES[0])
 # Demuxers we accept for uploads. Playlist formats such as HLS can make FFmpeg read other local files.
 SOURCE_FORMATS = 'mov,mp4,m4a,3gp,3g2,mj2,matroska,webm'
-STYLES = {'basic':{'name':'기본 스타일','title':'yellow','caption':'white'},'clean':{'name':'깔끔 자막','title':'white','caption':'white'},'red':{'name':'강렬 빨강','title':'0xff626e','caption':'yellow'},'news':{'name':'뉴스형','title':'0x73d9ff','caption':'white'}}
+# title: first line of the headline, title2: the other lines, caption: narration text, highlight: words marked *like this* in the script.
+STYLES = {'basic':{'name':'기본 스타일','title':'#ffe34a','title2':'#ff5a5a','caption':'#ffffff','highlight':'#5ac8ff'},
+          'clean':{'name':'깔끔 자막','title':'#ffffff','title2':'#5ac8ff','caption':'#ffffff','highlight':'#ffffff'},
+          'red':{'name':'강렬 빨강','title':'#ff4d4d','title2':'#ffffff','caption':'#ffffff','highlight':'#ff4d4d'},
+          'news':{'name':'뉴스형','title':'#ffffff','title2':'#5ac8ff','caption':'#ffffff','highlight':'#5ac8ff'}}
 LOCK = threading.Lock()
 CONNECT = None
 CONFIG_LOCK = threading.RLock()
@@ -68,8 +72,11 @@ def default_settings():return {'style':'basic','duration':58,'start':0,'mute':Fa
 SCALE=1.5
 def px(value):return round(value*SCALE)
 WIDTH,HEIGHT,TITLE_HEIGHT,CAPTION_TOP=px(720),px(1280),px(230),px(1060)
-TITLE_FONT,TITLE_Y,TITLE_SPACING=px(38),px(65),px(10)
-CAPTION_FONT,CAPTION_Y,CAPTION_SPACING,CAPTION_PADDING=px(30),px(1080),px(8),px(12)
+# Headline sizes, tried in order: (characters per line, font size, max lines). Big two-line titles first.
+TITLE_FITS=[(9,px(72),2),(12,px(54),2),(18,px(35),3)]
+TITLE_OUTLINE=px(5)
+# Narration captions: bold white text with a thick outline, bottom edge at CAPTION_BOTTOM.
+CAPTION_FONT,CAPTION_LINE_CHARS,CAPTION_BOTTOM,CAPTION_OUTLINE=px(50),12,px(1160),px(6)
 LAYOUTS={'fill':'화면 꽉 채우기','fit':'원본 맞추기'}
 
 
@@ -220,6 +227,86 @@ def filter_path(path):
     return "'"+value.replace(':','\\:')+"'"
 
 
+def font_family(path):
+    """Read the family name from a TTF/OTF/TTC file so libass can pick it from fontsdir."""
+    import struct
+    data=Path(path).read_bytes()
+    offset=struct.unpack('>I',data[12:16])[0] if data[:4]==b'ttcf' else 0
+    tables=struct.unpack('>H',data[offset+4:offset+6])[0]
+    for i in range(tables):
+        tag,_,table,_=struct.unpack('>4sIII',data[offset+12+16*i:offset+28+16*i])
+        if tag!=b'name':continue
+        _,count,strings=struct.unpack('>HHH',data[table:table+6]);names={}
+        for j in range(count):
+            platform,encoding,language,name_id,length,start=struct.unpack('>6H',data[table+6+12*j:table+18+12*j])
+            if name_id==1 and platform==3 and encoding in (1,10):
+                names[language]=data[table+strings+start:table+strings+start+length].decode('utf-16-be',errors='ignore')
+        if names:return names.get(0x409) or next(iter(names.values()))
+    raise ValueError('font name')
+
+
+def ass_color(value):return '&H00'+value[5:7]+value[3:5]+value[1:3]+'&'
+
+
+def ass_text(value):return value.replace('\\','＼').replace('{','｛').replace('}','｝')
+
+
+def title_lines(headline):
+    for width,size,limit in TITLE_FITS:
+        lines=textwrap.wrap(headline,width)
+        if len(lines)<=limit:return lines,size
+    return textwrap.wrap(headline,TITLE_FITS[-1][0]),TITLE_FITS[-1][1]
+
+
+def caption_words(script):
+    """Split the script into (word, highlighted) pairs. Words wrapped in *asterisks* are highlighted."""
+    words=[]
+    for index,part in enumerate(re.split(r'\*([^*]+)\*',script)):
+        for word in part.split():
+            while len(word)>CAPTION_LINE_CHARS:words.append((word[:CAPTION_LINE_CHARS],index%2==1));word=word[CAPTION_LINE_CHARS:]
+            if word:words.append((word.replace('*',''),index%2==1))
+    return [w for w in words if w[0]]
+
+
+def caption_chunks(script):
+    """Group words into on-screen captions of up to two lines each."""
+    chunks,lines,line=[],[],[]
+    for word in caption_words(script):
+        if line and sum(len(w)+1 for w,_ in line)+len(word[0])>CAPTION_LINE_CHARS:
+            lines.append(line);line=[]
+            if len(lines)==2:chunks.append(lines);lines=[]
+        line.append(word)
+        if word[0][-1] in '.?!。':lines.append(line);line=[];chunks.append(lines);lines=[]
+    if line:lines.append(line)
+    if lines:chunks.append(lines)
+    return chunks
+
+
+def subtitles(doc,style,duration,captions):
+    """Build the ASS subtitle file (headline + narration captions) and the matching SRT text."""
+    lines,size=title_lines(doc['headline'])
+    title=r'\N'.join(('{\\c'+ass_color(style['title' if i==0 else 'title2'])+'}')+ass_text(line) for i,line in enumerate(lines))
+    family=font_family(FONT)
+    ass=['[Script Info]','ScriptType: v4.00+',f'PlayResX: {WIDTH}',f'PlayResY: {HEIGHT}','WrapStyle: 2','ScaledBorderAndShadow: yes','',
+         '[V4+ Styles]','Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+         f'Style: Title,{family},{size},{ass_color(style["title"])},&H000000FF&,&H00000000&,&H00000000&,-1,0,0,0,100,100,0,0,1,{TITLE_OUTLINE},0,5,0,0,0,1',
+         f'Style: Caption,{family},{CAPTION_FONT},{ass_color(style["caption"])},&H000000FF&,&H00000000&,&H80000000&,-1,0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},{px(2)},2,0,0,0,1',
+         '','[Events]','Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+         f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT//2})}}{title}']
+    srt=[];chunks=caption_chunks(doc['script'])
+    for index,chunk in enumerate(chunks):
+        start=duration*index/len(chunks);end=duration*(index+1)/len(chunks)
+        srt.extend([str(index+1),f'{srt_time(start)} --> {srt_time(end)}','\n'.join(' '.join(w for w,_ in line) for line in chunk),''])
+        text=r'\N'.join(' '.join(('{\\c'+ass_color(style['highlight'])+'}'+ass_text(w)+'{\\c'+ass_color(style['caption'])+'}') if marked else ass_text(w) for w,marked in line) for line in chunk)
+        if captions:ass.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{{\\pos({WIDTH//2},{CAPTION_BOTTOM})}}{text}')
+    return '\n'.join(ass)+'\n','\n'.join(srt)
+
+
+def ass_time(seconds):
+    cs=round(seconds*100);hours,cs=divmod(cs,360000);minutes,cs=divmod(cs,6000);seconds,cs=divmod(cs,100)
+    return f'{hours}:{minutes:02}:{seconds:02}.{cs:02}'
+
+
 def srt_time(seconds):
     ms=round(seconds*1000);hours,ms=divmod(ms,3600000);minutes,ms=divmod(ms,60000);seconds,ms=divmod(ms,1000)
     return f'{hours:02}:{minutes:02}:{seconds:02},{ms:03}'
@@ -230,19 +317,15 @@ def render(p):
     try:
         run.mkdir(parents=True)
         source=directory/doc['source']['filename'];cfg=doc['settings'];duration=min(cfg['duration'],doc['source']['duration']-cfg['start'])
-        style=STYLES[cfg['style']];title=run/'headline.txt';title.write_text('\n'.join(textwrap.wrap(doc['headline'],18)),encoding='utf-8')
+        style=STYLES[cfg['style']]
         vf=layout_filters(cfg.get('layout','fill'))
         if cfg['mirror']:vf.append('hflip')
-        vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"drawtext=fontfile={filter_path(FONT)}:textfile={filter_path(title)}:expansion=none:fontcolor={style['title']}:fontsize={TITLE_FONT}:x=(w-text_w)/2:y={TITLE_Y}:line_spacing={TITLE_SPACING}"])
-        chunks=textwrap.wrap(re.sub(r'\s+',' ',doc['script']),38)
-        srt=[]
-        for index,chunk in enumerate(chunks):
-            start=duration*index/len(chunks);end=duration*(index+1)/len(chunks)
-            srt.extend([str(index+1),f'{srt_time(start)} --> {srt_time(end)}','\n'.join(textwrap.wrap(chunk,19)),''])
-            if cfg['captions']:
-                text=run/f'caption-{index}.txt';text.write_text('\n'.join(textwrap.wrap(chunk,19)),encoding='utf-8')
-                vf.append(f"drawtext=fontfile={filter_path(FONT)}:textfile={filter_path(text)}:expansion=none:fontcolor={style['caption']}:fontsize={CAPTION_FONT}:box=1:boxcolor=black@0.8:boxborderw={CAPTION_PADDING}:x=(w-text_w)/2:y={CAPTION_Y}:line_spacing={CAPTION_SPACING}:enable='gte(t,{start:.6f})*lt(t,{end:.6f})'")
-        (run/'captions.srt').write_text('\n'.join(srt),encoding='utf-8')
+        # libass loads the font from its own folder, so it does not depend on the system font setup (fontconfig on Windows).
+        fonts=run/'fonts';fonts.mkdir();shutil.copyfile(FONT,fonts/Path(FONT).name)
+        ass,srt=subtitles(doc,style,duration,cfg['captions'])
+        (run/'overlay.ass').write_text(ass,encoding='utf-8')
+        vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"ass=filename={filter_path(run/'overlay.ass')}:fontsdir={filter_path(fonts)}"])
+        (run/'captions.srt').write_text(srt,encoding='utf-8')
         output=run/'short.mp4'
         command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-ss',str(cfg['start']),'-threads','2','-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source),'-t',str(duration),'-map','0:v:0']
         if not cfg['mute']:command+=['-map','0:a:0?']
@@ -255,6 +338,7 @@ def render(p):
         with zipfile.ZipFile(run/'project.zip','w',compression=zipfile.ZIP_STORED) as archive:
             for name in ('short.mp4','captions.srt','project.json'):archive.write(run/name,name)
         doc.update({'output':str(output.relative_to(directory)),'archive':str((run/'project.zip').relative_to(directory)),'message':'MP4와 자막·프로젝트 설정 묶음 제작이 완료되었습니다. 원음 유지 방식이며 합성 음성은 없습니다.','render_info':result})
+        shutil.rmtree(fonts,ignore_errors=True)
         p['status']='completed';store(p)
     except Exception as exc:
         if not isinstance(exc,(ValueError,OSError,subprocess.SubprocessError)):traceback.print_exc()
