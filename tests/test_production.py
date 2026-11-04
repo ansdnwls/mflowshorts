@@ -140,6 +140,23 @@ class ProductionTests(unittest.TestCase):
         graph=production.blur_graph(','.join(production.layout_filters('band')),boxes,1)+',drawbox=x=0:y=0:w=iw:h=10:color=black:t=fill'
         result=subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=640x360:rate=10','-t','1','-vf',graph,'-f','null','-'],capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
+    def test_caption_timeline(self):
+        items=production.cues([{'text':'둘째','start':3,'pos':'middle','look':'box','y':10},{'text':' 첫 *줄* ','sub':'first line','start':0,'pos':'top','look':'accent'},{'text':'','start':5}])
+        self.assertEqual([c['text'] for c in items],['첫 *줄*','둘째'])
+        for bad in ([{'text':'a','start':70}],[{'text':'a','start':3,'end':2}],[{'text':'a','pos':'left'}],[{'text':'a','look':'neon'}],[{'text':'가'*61}],'x'):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):production.cues(bad)
+        doc={'headline':'제목','script':'이 대본은 쓰이지 않아요','cues':items}
+        with patch.object(production,'font_info',return_value=('Test Font',700)):
+            ass,srt=production.subtitles(doc,production.STYLES['basic'],10,True)
+            hidden,_=production.subtitles(doc,production.STYLES['basic'],10,False)
+        self.assertIn('0:00:00.00,0:00:03.00,CaptionAccent,,0,0,0,,{\\an8\\pos(540,510)}',ass)
+        self.assertIn(f'0:00:03.00,0:00:11.00,CaptionBox,,0,0,0,,{{\\an5\\pos(540,{975+production.px(10)})}}둘째',ass)
+        self.assertIn('first line',ass);self.assertNotIn('쓰이지',ass)
+        self.assertIn('첫 줄\nfirst line',srt);self.assertIn('00:00:03,000 --> 00:00:10,000',srt)
+        self.assertNotIn('CaptionBox,,',hidden)
+        base={'source':{'filename':'a.mp4'},'script':'s','headline':'h','settings':production.default_settings()}
+        self.assertEqual(production.fingerprint(base),production.fingerprint({**base,'cues':[]}))
+        self.assertNotEqual(production.fingerprint(base),production.fingerprint({**base,'cues':items}))
     def test_rendering_project_cannot_be_edited(self):
         p=production.project(self.ident);p['status']='rendering';production.store(p)
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'script':'edit'})

@@ -208,7 +208,7 @@ def update_project(data):
     script=str(data.get('script',doc['script'])).strip();headline=str(data.get('headline',doc['headline'])).strip()
     context=str(data.get('context',doc.get('context',''))).strip()
     source_url=str(data.get('source_url',doc.get('source_url',''))).strip()
-    credit=re.sub(r'\s+',' ',str(data.get('credit',doc.get('credit','')))).strip();cards=comments(data.get('comments',doc.get('comments',[])));boxes=blurs(data.get('blurs',doc.get('blurs',[])))
+    credit=re.sub(r'\s+',' ',str(data.get('credit',doc.get('credit','')))).strip();cards=comments(data.get('comments',doc.get('comments',[])));boxes=blurs(data.get('blurs',doc.get('blurs',[])));timeline=cues(data.get('cues',doc.get('cues',[])))
     if len(credit)>60:raise ValueError('출처 표시는 60자 이내로 입력하세요.')
     if len(textwrap.wrap(headline,18))>3:raise ValueError('상단 제목은 화면에서 3줄(약 50자) 이내여야 합니다. 줄여서 입력하세요.')
     if not title or len(title)>100 or not headline or len(headline)>60 or len(script)>800 or len(context)>2000 or len(source_url)>2048:raise ValueError('이름 100자·상단 제목 60자·대본 800자·맥락 메모 2000자 이내로 입력하세요.')
@@ -216,7 +216,7 @@ def update_project(data):
         from urllib.parse import urlsplit
         u=urlsplit(source_url)
         if u.scheme!='https' or not u.hostname or u.username or u.password:raise ValueError('출처는 HTTPS 링크로 입력하세요.')
-    p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'credit_on':bool(data.get('credit_on',doc.get('credit_on',True))),'comments':cards,'blurs':boxes,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
+    p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'credit_on':bool(data.get('credit_on',doc.get('credit_on',True))),'comments':cards,'blurs':boxes,'cues':timeline,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
     doc.pop('output',None);doc.pop('archive',None)
     p['status']='script_ready' if script and doc['source'] else 'source_ready' if doc['source'] else 'draft'
     doc['message']='대본과 설정을 검토한 뒤 승인하세요.' if p['status']=='script_ready' else '원본과 대본을 준비하세요.'
@@ -269,7 +269,7 @@ def save_source(project_id,path,info):
 def fingerprint(doc):
     # credit/comments only count when set, so projects approved before they existed stay approved.
     data={k:doc.get(k) for k in ('source','script','headline','settings')}
-    data.update({k:doc[k] for k in ('credit','comments','blurs') if doc.get(k)})
+    data.update({k:doc[k] for k in ('credit','comments','blurs','cues') if doc.get(k)})
     if doc.get('credit_on') is False:data['credit_on']=False
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
@@ -304,6 +304,59 @@ def blur_graph(chain,boxes,duration):
         end=box['end'] or duration+1
         graph.append(f"[v{i}]split[m{i}][s{i}];[s{i}]crop={w}:{h}:{x}:{y},boxblur={radius}:3[b{i}];[m{i}][b{i}]overlay={x}:{y}:enable='between(t,{box['start']},{end})'[v{i+1}]")
     return ';'.join(graph)+f';[v{len(boxes)}]null'
+
+
+# Caption timeline: each script line with its own time, place and look (empty = equal split of the script).
+CUE_POSITIONS=('bottom','middle','top')
+CUE_LOOKS={'outline':'Caption','box':'CaptionBox','accent':'CaptionAccent','lyric':'Lyric'}
+CUE_ACCENT='#ffe34a'
+MAX_CUES=40
+def cues(value):
+    """Validate timeline lines: {'text','sub','start','end','pos','look','y'}. end 0 = until the next line."""
+    if not isinstance(value,list) or len(value)>MAX_CUES:raise ValueError(f'자막 타임라인은 최대 {MAX_CUES}줄입니다.')
+    result=[]
+    for item in value:
+        if not isinstance(item,dict):raise ValueError('자막 타임라인 형식을 확인하세요.')
+        text=re.sub(r'\s+',' ',str(item.get('text',''))).strip();sub=re.sub(r'\s+',' ',str(item.get('sub',''))).strip()
+        if not text:continue
+        try:start,end,y=float(item.get('start') or 0),float(item.get('end') or 0),int(round(float(item.get('y') or 0)))
+        except (TypeError,ValueError,OverflowError):raise ValueError('자막 시점은 숫자로 입력하세요.') from None
+        pos=item.get('pos') or 'bottom';look=item.get('look') or 'outline'
+        if len(text)>60 or len(sub)>60:raise ValueError('자막 한 줄은 60자 이내로 입력하세요.')
+        if not all(math.isfinite(v) for v in (start,end)) or not 0<=start<=60 or not 0<=end<=60 or (end and end<=start):raise ValueError('자막 시점은 0~60초이고, 끝은 시작보다 뒤여야 합니다(0이면 다음 줄까지).')
+        if pos not in CUE_POSITIONS or look not in CUE_LOOKS or not -OFFSET_LIMIT<=y<=OFFSET_LIMIT:raise ValueError('자막 위치와 모양을 다시 고르세요.')
+        result.append({'text':text,'sub':sub,'start':round(start,2),'end':round(end,2),'pos':pos,'look':look,'y':y})
+    return sorted(result,key=lambda c:c['start'])
+
+
+def cue_lines(text):
+    """Wrap one timeline line like the captions (about 12 characters a line, 3 lines at most)."""
+    lines,line=[],[]
+    for word in caption_words(text):
+        if line and sum(len(w)+1 for w,_ in line)+len(word[0])>CAPTION_LINE_CHARS:lines.append(line);line=[]
+        line.append(word)
+    if line:lines.append(line)
+    return lines[:3]
+
+
+def cue_events(items,style,layout,duration,shift=0):
+    """ASS events and SRT text for the caption timeline."""
+    video_bottom=HEIGHT if layout=='fill' else VIDEO_BOTTOM
+    anchors={'top':(8,TITLE_HEIGHT+px(40)),'middle':(5,(TITLE_HEIGHT+video_bottom)//2),'bottom':(2,CAPTION_BOTTOM.get(layout,CAPTION_BOTTOM['band']))}
+    events,srt=[],[]
+    for index,cue in enumerate(items):
+        start=min(cue['start'],duration);end=cue['end'] or (items[index+1]['start'] if index+1<len(items) else duration+1)
+        end=min(end,duration+1)
+        if end<=start:continue
+        name=CUE_LOOKS[cue['look']];base=CUE_ACCENT if cue['look']=='accent' else style['caption'] if cue['look'] in ('outline','box') else '#ffffff'
+        mark=style['highlight'] if cue['look']!='accent' else style['caption']
+        text=r'\N'.join(' '.join(('{\\c'+ass_color(mark)+'}'+ass_text(w)+'{\\c'+ass_color(base)+'}') if marked else ass_text(w) for w,marked in line) for line in cue_lines(cue['text']))
+        if cue['sub']:text+=r'\N{\fs'+str(px(26))+r'\i0\c'+ass_color('#ffffff')+'}'+ass_text(cue['sub'])
+        align,y=anchors[cue['pos']]
+        events.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},{name},,0,0,0,,{{\\an{align}\\pos({WIDTH//2},{y+px(cue["y"])+shift})}}{text}')
+        plain=cue['text'].replace('*','')+('\n'+cue['sub'] if cue['sub'] else '')
+        srt.extend([str(len(srt)//4+1),f'{srt_time(start)} --> {srt_time(min(end,duration))}',plain,''])
+    return events,'\n'.join(srt)
 
 
 def comments(value):
@@ -451,6 +504,9 @@ def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layo
          '[V4+ Styles]','Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
          f'Style: Title,{title_family},{size},{ass_color(style["title"])},&H000000FF&,&H00000000&,&H00000000&,{title_bold},0,0,0,100,100,0,0,1,{TITLE_OUTLINE},0,2,0,0,0,1',
          f'Style: Caption,{caption_family},{CAPTION_FONT},{ass_color(style["caption"])},&H000000FF&,&H00000000&,&H80000000&,{caption_bold},0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},{px(2)},2,0,0,0,1',
+         f'Style: CaptionBox,{caption_family},{px(40)},{ass_color(style["caption"])},&H000000FF&,&H20000000&,&H00000000&,{caption_bold},0,0,0,100,100,0,0,3,{px(10)},0,2,0,0,0,1',
+         f'Style: CaptionAccent,{caption_family},{CAPTION_FONT},{ass_color(CUE_ACCENT)},&H000000FF&,&H00000000&,&H80000000&,{caption_bold},0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},{px(2)},2,0,0,0,1',
+         f'Style: Lyric,{caption_family},{px(32)},&H00FFFFFF&,&H000000FF&,&H00000000&,&H80000000&,0,-1,0,0,100,100,0,0,1,{px(3)},{px(1)},2,0,0,0,1',
          f'Style: Credit,{ui_family},{CREDIT_FONT},&H00D8D8D8&,&H000000FF&,&H00000000&,&H00000000&,0,0,0,0,100,100,0,0,1,{px(1)},0,2,0,0,0,1',
          f'Style: Card,{ui_family},20,&H00FFFFFF&,&H000000FF&,&H00000000&,&H60000000&,0,0,0,0,100,100,0,0,1,0,{px(3)},7,0,0,0,1',
          f'Style: CommentName,{ui_family},{COMMENT_NAME_FONT},&H00707070&,&H000000FF&,&H00000000&,&H00000000&,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
@@ -459,6 +515,10 @@ def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layo
          f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{title_bottom+shift["title_y"]})}}{title}']
     if credit:ass.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Credit,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT-px(12)+shift["credit_y"]})}}{ass_text(credit)}')
     ass.extend(comment_events(doc.get('comments') or [],layout,duration,shift['comment_y']))
+    if doc.get('cues'):
+        events,srt=cue_events(doc['cues'],style,layout,duration,shift['caption_y'])
+        if captions:ass.extend(events)
+        return '\n'.join(ass)+'\n',srt
     srt=[];chunks=caption_chunks(doc['script'])
     for index,chunk in enumerate(chunks):
         start=duration*index/len(chunks);end=duration*(index+1)/len(chunks)
@@ -502,7 +562,7 @@ def render(p):
         subprocess.run(command,capture_output=True,timeout=480,check=True)
         result=probe(output)
         if result['width']!=WIDTH or result['height']!=HEIGHT:raise ValueError('render size')
-        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','blurs':doc.get('blurs') or [],'approved_hash':doc['approved_hash']}
+        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'manual timeline' if doc.get('cues') else 'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','blurs':doc.get('blurs') or [],'approved_hash':doc['approved_hash']}
         (run/'project.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
         with zipfile.ZipFile(run/'project.zip','w',compression=zipfile.ZIP_STORED) as archive:
             for name in ('short.mp4','captions.srt','project.json'):archive.write(run/name,name)

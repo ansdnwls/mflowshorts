@@ -44,3 +44,20 @@
 .blur-row button,#blur-add{font-size:12px;padding:4px 10px;white-space:nowrap}
 #production-form #blur-list .blur-row label{white-space:nowrap;display:flex;flex-direction:row;align-items:center;gap:4px;margin:0;font-size:12px}
 #production-form #blur-list .blur-row input{padding:6px 8px}
+.cue-panel{border:1px solid var(--line);border-radius:9px;padding:10px 14px;display:grid;gap:8px;margin:10px 0}
+.cue-panel legend{font-size:12px;padding:0 4px}
+.cue-panel .hint{margin:0}
+#cue-list{display:grid;gap:8px}
+.cue-row{border:1px solid var(--line);border-radius:8px;padding:8px;display:grid;gap:6px;background:#fafbfe}
+.cue-row.active{border-color:var(--purple);box-shadow:0 0 0 1px var(--purple)}
+.cue-texts{display:grid;grid-template-columns:2fr 1.3fr;gap:6px}
+.cue-controls{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+#production-form .cue-controls label{display:flex;flex-direction:row;align-items:center;gap:4px;margin:0;font-size:12px;white-space:nowrap}
+#production-form .cue-controls input[type=number]{width:64px;padding:5px 6px}
+#production-form .cue-controls select{width:auto;padding:5px 6px;font-size:12px}
+.cue-controls button,.cue-actions button{font-size:12px;padding:4px 10px;white-space:nowrap}
+.cue-actions{display:flex;gap:6px;flex-wrap:wrap}
+#preview-caption.look-box span.line{background:#000000e0;padding:0 .25em;border-radius:2px}
+#preview-caption.look-box{text-shadow:none}
+#preview-caption.look-lyric{font-style:italic;font-weight:600}
+#preview-caption small{display:block;font-weight:600;font-style:normal;color:#fff}
