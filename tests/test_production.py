@@ -119,13 +119,14 @@ class ProductionTests(unittest.TestCase):
         for bad in (301,-301,'x',float('nan')):
             with self.subTest(bad=bad),self.assertRaises(ValueError):production.settings({'caption_y':bad})
     def test_blur_boxes(self):
-        boxes=production.blurs([{'x':0.05,'y':0.6,'w':2,'h':0.1},{'x':0.5,'y':0.5,'w':0.001,'h':0.001},{'x':0,'y':0,'w':0.5,'h':0.1,'start':1,'end':3}])
+        boxes=production.blurs([{'x':0.05,'y':0.6,'w':2,'h':0.1},{'x':0.5,'y':0.5,'w':0.001,'h':0.001},{'x':0,'y':0,'w':0.5,'h':0.1,'start':1,'end':3,'mode':'blur'}])
+        self.assertEqual([b['mode'] for b in boxes],['erase','blur'])
         self.assertEqual(len(boxes),2)  # the tiny one is dropped
         self.assertAlmostEqual(boxes[0]['w'],0.95)  # clamped to the frame
-        for bad in ('x',[{'x':'a'}],[{'x':0,'y':0,'w':0.5,'h':0.5,'start':3,'end':2}],[{'x':0,'y':0,'w':0.5,'h':0.5}]*7):
+        for bad in ('x',[{'x':'a'}],[{'x':0,'y':0,'w':0.5,'h':0.5,'start':3,'end':2}],[{'x':0,'y':0,'w':0.5,'h':0.5}]*7,[{'x':0,'y':0,'w':0.5,'h':0.5,'mode':'pixelate'}]):
             with self.subTest(bad=bad),self.assertRaises(ValueError):production.blurs(bad)
         graph=production.blur_graph('scale=1080:1920',boxes,5)
-        self.assertEqual(graph.count('boxblur='),2)
+        self.assertEqual(graph.count('delogo='),1);self.assertEqual(graph.count('boxblur='),1);self.assertEqual(graph.count('alphamerge'),2)
         self.assertIn("enable='between(t,1.0,3.0)'",graph);self.assertIn("enable='between(t,0.0,6)'",graph)
         self.assertTrue(graph.endswith('[v2]null'))
         self.assertEqual(production.blur_graph('scale=1080:1920',[],5),'scale=1080:1920')
@@ -136,10 +137,19 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(production.project(self.ident)['document']['blurs'],boxes)
     @unittest.skipUnless(shutil.which('ffmpeg'),'needs ffmpeg')
     def test_blur_graph_runs_in_ffmpeg(self):
-        boxes=production.blurs([{'x':0.05,'y':0.6,'w':0.9,'h':0.1},{'x':0.1,'y':0.3,'w':0.3,'h':0.05,'start':0.2,'end':0.6}])
+        boxes=production.blurs([{'x':0.05,'y':0.6,'w':0.9,'h':0.1},{'x':0.1,'y':0.3,'w':0.3,'h':0.05,'start':0.2,'end':0.6,'mode':'blur'},{'x':0,'y':0,'w':1,'h':0.02},{'x':0.9,'y':0.97,'w':0.1,'h':0.03,'mode':'blur'}])  # edge boxes too
         graph=production.blur_graph(','.join(production.layout_filters('band')),boxes,1)+',drawbox=x=0:y=0:w=iw:h=10:color=black:t=fill'
         result=subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=640x360:rate=10','-t','1','-vf',graph,'-f','null','-'],capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
+    @unittest.skipUnless(shutil.which('ffmpeg'),'needs ffmpeg')
+    def test_preview_frame_png(self):
+        source=Path(self.temp.name)/'src.mp4'
+        subprocess.run(['ffmpeg','-loglevel','error','-f','lavfi','-i','testsrc=size=320x568:rate=10','-t','2','-pix_fmt','yuv420p',str(source)],check=True)
+        with source.open('rb') as f:production.upload(self.ident,f,source.stat().st_size)
+        production.update_project({'id':self.ident,'blurs':[{'x':0.1,'y':0.6,'w':0.8,'h':0.05}]})
+        png=production.preview_frame(self.ident,'1')
+        self.assertTrue(png.startswith(b'\x89PNG'))
+        self.assertTrue(production.preview_frame(self.ident,'nan').startswith(b'\x89PNG'))
     def test_caption_timeline(self):
         items=production.cues([{'text':'둘째','start':3,'pos':'middle','look':'box','y':10},{'text':' 첫 *줄* ','sub':'first line','start':0,'pos':'top','look':'accent'},{'text':'','start':5}])
         self.assertEqual([c['text'] for c in items],['첫 *줄*','둘째'])

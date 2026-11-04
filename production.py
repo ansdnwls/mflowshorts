@@ -288,22 +288,57 @@ def blurs(value):
         box['w'],box['h']=min(max(box['w'],0),1-box['x']),min(max(box['h'],0),1-box['y'])
         if box['w']*WIDTH<16 or box['h']*HEIGHT<16:continue  # too small to matter
         if not 0<=box['start']<=60 or not 0<=box['end']<=60 or (box['end'] and box['end']<=box['start']):raise ValueError('블러 시간은 0~60초이고, 끝 시간은 시작보다 뒤여야 합니다(0이면 끝까지).')
-        result.append({k:round(v,4) for k,v in box.items()})
+        mode=item.get('mode') or 'erase'
+        if mode not in BLUR_MODES:raise ValueError('가리기 방식을 다시 고르세요.')
+        result.append({**{k:round(v,4) for k,v in box.items()},'mode':mode})
     return result
 
 
+BLUR_MODES=('erase','blur')
+FEATHER=px(11)  # soft edge so the box outline does not show
+
+
 def blur_graph(chain,boxes,duration):
-    """Filter graph that blurs each box on the laid-out frame, before the title and captions are drawn on top."""
+    """Filter graph that hides each box on the laid-out frame, before the title and captions are drawn on top.
+
+    erase: delogo fills the box from the pixels around it, so the text looks gone rather than smudged.
+    blur: strong box blur. Both fade out over FEATHER pixels at the edges.
+    """
     if not boxes:return chain
-    graph=[f'{chain}[v0]']
+    graph=[f'{chain},format=yuv420p[v0]']
     for i,box in enumerate(boxes):
-        x,y=round(box['x']*WIDTH)//2*2,round(box['y']*HEIGHT)//2*2
-        w,h=max(16,round(box['w']*WIDTH)//2*2),max(16,round(box['h']*HEIGHT)//2*2)
-        w,h=min(w,WIDTH-x),min(h,HEIGHT-y)
-        radius=max(2,min(px(14),min(w,h)//4-1))  # boxblur needs radius <= half the (chroma) size
-        end=box['end'] or duration+1
-        graph.append(f"[v{i}]split[m{i}][s{i}];[s{i}]crop={w}:{h}:{x}:{y},boxblur={radius}:3[b{i}];[m{i}][b{i}]overlay={x}:{y}:enable='between(t,{box['start']},{end})'[v{i+1}]")
+        # delogo needs a band of real pixels around the box, so keep it 2px inside the frame.
+        x=min(max(round(box['x']*WIDTH),2),WIDTH-18);y=min(max(round(box['y']*HEIGHT),2),HEIGHT-18)
+        w=min(max(16,round(box['w']*WIDTH)),WIDTH-2-x);h=min(max(16,round(box['h']*HEIGHT)),HEIGHT-2-y)
+        left,top=min(FEATHER,x),min(FEATHER,y);right,bottom=min(FEATHER,WIDTH-x-w),min(FEATHER,HEIGHT-y-h)
+        cx,cy,cw,ch=x-left,y-top,w+left+right,h+top+bottom
+        if box.get('mode','erase')=='erase':hide=f'delogo=x={left}:y={top}:w={w}:h={h},gblur=sigma=6:sigmaV=1.5'  # mostly sideways: smooths delogo's vertical streaks
+        else:hide=f'boxblur={max(2,min(px(14),min(cw,ch)//4-1))}:3'  # boxblur radius must fit the (chroma) size
+        # alphamerge reads the mask's luma. Keep it yuv420p: split forces one format on both branches, and gray would make the whole video gray.
+        mask=f"geq=lum='255*min(1,min(min(X,W-1-X),min(Y,H-1-Y))/{FEATHER})':cb=128:cr=128"
+        on=f"between(t,{box['start']},{box['end'] or duration+1})"
+        graph.append(f"[v{i}]split[m{i}][s{i}];[s{i}]crop={cw}:{ch}:{cx}:{cy},split[k{i}][q{i}];[q{i}]{mask}[a{i}];[k{i}]{hide}[h{i}];[h{i}][a{i}]alphamerge[f{i}];[m{i}][f{i}]overlay={cx}:{cy}:enable='{on}'[v{i+1}]")
     return ';'.join(graph)+f';[v{len(boxes)}]null'
+
+
+def preview_frame(project_id,at):
+    """One PNG frame of the source with layout and blur boxes applied, to check the boxes before rendering."""
+    p=project(project_id);doc=p['document'];cfg=doc['settings']
+    if not doc.get('source'):raise ValueError('원본 영상을 먼저 업로드하세요.')
+    duration=min(cfg['duration'],doc['source']['duration']-cfg['start'])
+    at=float(at)
+    if not math.isfinite(at):at=0
+    at=min(max(at,0),max(duration-0.05,0))
+    vf=layout_filters(cfg.get('layout','fill'))
+    if cfg['mirror']:vf.append('hflip')
+    # -ss before -i resets t to 0, so shift the box times by the same amount.
+    boxes=[{**b,'start':b['start']-at,'end':(b['end']-at) if b['end'] else 0} for b in doc.get('blurs') or [] if not b['end'] or b['end']>at]
+    boxes=[{**b,'start':max(b['start'],0),'end':max(b['end'],0.01) if b['end'] else 0} for b in boxes]
+    graph=blur_graph(','.join(vf),boxes,1)+',scale=540:-2'
+    command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-ss',str(cfg['start']+at),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(PROJECT_ROOT/project_id/doc['source']['filename']),'-frames:v','1','-vf',graph,'-f','image2pipe','-c:v','png','-']
+    result=subprocess.run(command,capture_output=True,timeout=60)
+    if result.returncode or not result.stdout:raise ValueError('미리보기 화면을 만들지 못했어요. 원본 영상과 시작 시간을 확인하세요.')
+    return result.stdout
 
 
 # Caption timeline: each script line with its own time, place and look (empty = equal split of the script).
