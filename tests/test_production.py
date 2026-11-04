@@ -1,4 +1,5 @@
 import io
+import os
 import shutil
 import subprocess
 import tempfile
@@ -185,6 +186,26 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(doc['script'],'')
         self.assertIsNone(doc['approved_hash'])
 
+    def test_letters_mode_needs_opencv(self):
+        self.assertEqual(production.blurs([{'x':0.1,'y':0.6,'w':0.8,'h':0.05,'mode':'text'}])[0]['mode'],'text')
+        with patch.object(production,'letters_ready',return_value=False),self.assertRaisesRegex(ValueError,'install_windows'):
+            production.erase_letters({'mode':'frame'})
+        self.assertIn('letters_ready',production.state());self.assertIn('names',production.state()['gpu'])
+    @unittest.skipUnless(shutil.which('ffmpeg') and os.environ.get('MFLOW_TEST_CV_PYTHON'),'needs ffmpeg and a Python with OpenCV (MFLOW_TEST_CV_PYTHON)')
+    def test_letters_mode_renders(self):
+        source=Path(self.temp.name)/'src.mp4'
+        subprocess.run(['ffmpeg','-loglevel','error','-f','lavfi','-i','testsrc=size=540x960:rate=30','-f','lavfi','-i','sine','-t','2','-vf',"drawbox=x=100:y=600:w=340:h=40:color=white:t=fill",'-pix_fmt','yuv420p','-shortest',str(source)],check=True)
+        with source.open('rb') as f:production.upload(self.ident,f,source.stat().st_size)
+        cfg={**production.default_settings(),'duration':2,'layout':'fit'}
+        production.update_project({'id':self.ident,'script':'대본','settings':cfg,'blurs':[{'x':0.1,'y':0.55,'w':0.8,'h':0.1,'mode':'text'},{'x':0.1,'y':0.3,'w':0.3,'h':0.05,'mode':'blur'}]})
+        production.approve(self.ident)
+        with patch.object(production,'MEDIA_PYTHON',Path(os.environ['MFLOW_TEST_CV_PYTHON'])),patch.dict(production._TOOL_CACHE,clear=True):
+            self.assertTrue(production.preview_frame(self.ident,'1').startswith(b'\x89PNG'))
+            p=production.project(self.ident);production.LOCK.acquire();production.render(p)
+        p=production.project(self.ident)
+        self.assertEqual(p['status'],'completed',p['document']['message'])
+        info=production.probe(production.PROJECT_ROOT/self.ident/p['document']['output'])
+        self.assertEqual((info['width'],info['height'],info['audio']),(1080,1920,True))
     def test_unexpected_render_error_is_recoverable(self):
         self.add_source();production.update_project({'id':self.ident,'script':'대본'});production.approve(self.ident)
         with patch.object(production,'state',return_value={'render_available':True}),patch.object(production.threading,'Thread') as thread:

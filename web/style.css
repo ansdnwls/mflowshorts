@@ -68,3 +68,4 @@
 #preview-caption.look-box{text-shadow:none}
 #preview-caption.look-lyric{font-style:italic;font-weight:600}
 #preview-caption small{display:block;font-weight:600;font-style:normal;color:#fff}
+.blur-box.mode-text{backdrop-filter:blur(10px) saturate(1.1);-webkit-backdrop-filter:blur(10px) saturate(1.1);background:#ffffff10}

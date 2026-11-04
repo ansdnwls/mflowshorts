@@ -20,6 +20,9 @@ FONT_CANDIDATES = ['/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc','C:/Win
 FONT = os.environ.get('MFLOW_FONT') or next((f for f in FONT_CANDIDATES if Path(f).is_file()),FONT_CANDIDATES[0])
 # Extra fonts the user drops in this folder (.ttf/.otf/.ttc) can be picked per project for the title and captions.
 # The folder is not in git because many free fonts do not allow redistribution.
+# The OpenCV text eraser runs in the media venv, like the platform tools.
+MEDIA_PYTHON = Path(os.environ.get('MFLOW_MEDIA_PYTHON',Path(__file__).parent/('data/media-venv/Scripts/python.exe' if os.name=='nt' else 'data/media-venv/bin/python')))
+_TOOL_CACHE = {}
 FONTS_DIR = Path(os.environ.get('MFLOW_FONTS_DIR',Path(__file__).parent/'fonts'))
 FONT_SUFFIXES = ('.ttf','.otf','.ttc')
 _FONT_CACHE = {}
@@ -57,7 +60,7 @@ def state():
         for row in con.execute('SELECT * FROM production_projects ORDER BY updated_at DESC'):
             p=dict(row);p['document']=json.loads(p['document']);projects.append(p)
         for p in projects:p['comment_info']=comment_info(con,p['document'])
-    return {'channels':channels,'projects':projects,'styles':STYLES,'fonts':available_fonts(),'render_available':bool(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(FONT).is_file())}
+    return {'channels':channels,'projects':projects,'styles':STYLES,'fonts':available_fonts(),'letters_ready':letters_ready(),'gpu':gpu_info(),'render_available':bool(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(FONT).is_file())}
 
 
 def comment_info(con,doc):
@@ -294,7 +297,7 @@ def blurs(value):
     return result
 
 
-BLUR_MODES=('erase','blur')
+BLUR_MODES=('erase','blur','text')
 FEATHER=px(11)  # soft edge so the box outline does not show
 
 
@@ -321,6 +324,45 @@ def blur_graph(chain,boxes,duration):
     return ';'.join(graph)+f';[v{len(boxes)}]null'
 
 
+def letters_ready():
+    """Whether the letters-only eraser can run (media venv with OpenCV). Cached for a minute."""
+    import time
+    cached=_TOOL_CACHE.get('letters')
+    if cached and time.time()-cached[0]<60:return cached[1]
+    ok=False
+    if MEDIA_PYTHON.is_file():
+        try:ok=subprocess.run([str(MEDIA_PYTHON),'-c','import cv2,numpy'],capture_output=True,timeout=30).returncode==0
+        except (OSError,subprocess.SubprocessError):ok=False
+    _TOOL_CACHE['letters']=(time.time(),ok);return ok
+
+
+def gpu_info():
+    """Graphics cards on this PC, to suggest the right text-removal method. Read once per run."""
+    if 'gpu' in _TOOL_CACHE:return _TOOL_CACHE['gpu']
+    names=[];nvidia=False
+    try:
+        result=subprocess.run(['nvidia-smi','--query-gpu=name,memory.total','--format=csv,noheader'],capture_output=True,text=True,timeout=10)
+        if result.returncode==0:
+            names=[line.strip() for line in result.stdout.splitlines() if line.strip()];nvidia=bool(names)
+    except (OSError,subprocess.SubprocessError):pass
+    if not names and os.name=='nt':
+        try:
+            result=subprocess.run(['powershell','-NoProfile','-Command','(Get-CimInstance Win32_VideoController).Name'],capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=20)
+            names=[line.strip() for line in result.stdout.splitlines() if line.strip()]
+        except (OSError,subprocess.SubprocessError):pass
+    info={'names':names[:4],'nvidia':nvidia or any('nvidia' in n.lower() for n in names)}
+    _TOOL_CACHE['gpu']=info;return info
+
+
+def erase_letters(task):
+    """Run text_eraser.py in the media venv. Returns its stdout (PNG bytes in frame mode)."""
+    if not letters_ready():raise ValueError('글자만 지우기(정밀)를 쓰려면 scripts\\install_windows.cmd 를 한 번 다시 실행해 OpenCV를 설치하세요.')
+    task={'width':WIDTH,'height':HEIGHT,'formats':SOURCE_FORMATS,**task}
+    result=subprocess.run([str(MEDIA_PYTHON),str(Path(__file__).parent/'text_eraser.py')],input=json.dumps(task).encode('utf-8'),capture_output=True,timeout=900)
+    if result.returncode:raise ValueError('글자만 지우기 처리에 실패했어요. 원본 영상과 박스 위치를 확인하세요.')
+    return result.stdout
+
+
 def preview_frame(project_id,at):
     """One PNG frame of the source with layout and blur boxes applied, to check the boxes before rendering."""
     p=project(project_id);doc=p['document'];cfg=doc['settings']
@@ -334,6 +376,12 @@ def preview_frame(project_id,at):
     # -ss before -i resets t to 0, so shift the box times by the same amount.
     boxes=[{**b,'start':b['start']-at,'end':(b['end']-at) if b['end'] else 0} for b in doc.get('blurs') or [] if not b['end'] or b['end']>at]
     boxes=[{**b,'start':max(b['start'],0),'end':max(b['end'],0.01) if b['end'] else 0} for b in boxes]
+    letters=[b for b in doc.get('blurs') or [] if b.get('mode')=='text']
+    boxes=[b for b in boxes if b.get('mode')!='text']
+    if letters:
+        png=erase_letters({'mode':'frame','source':str(PROJECT_ROOT/project_id/doc['source']['filename']),'start':cfg['start'],'at':at,'chain':blur_graph(','.join(vf),boxes,1),'boxes':letters})
+        if not png.startswith(b'\x89PNG'):raise ValueError('미리보기 화면을 만들지 못했어요.')
+        return png
     graph=blur_graph(','.join(vf),boxes,1)+',scale=540:-2'
     command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-ss',str(cfg['start']+at),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(PROJECT_ROOT/project_id/doc['source']['filename']),'-frames:v','1','-vf',graph,'-f','image2pipe','-c:v','png','-']
     result=subprocess.run(command,capture_output=True,timeout=60)
@@ -581,7 +629,14 @@ def render(p):
         style=STYLES[cfg['style']]
         vf=layout_filters(cfg.get('layout','fill'))
         if cfg['mirror']:vf.append('hflip')
-        vf=[blur_graph(','.join(vf),doc.get('blurs') or [],duration)]
+        boxes=doc.get('blurs') or [];letters=[b for b in boxes if b.get('mode')=='text']
+        source_args=['-ss',str(cfg['start']),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source)]
+        if letters:
+            # Letters-only erase works frame by frame in OpenCV on the laid-out video; the result replaces the source picture.
+            cleaned=run/'cleaned.mp4'
+            erase_letters({'mode':'video','source':str(source),'start':cfg['start'],'duration':duration,'chain':','.join(vf),'boxes':letters,'output':str(cleaned)})
+            vf=[];source_args=['-i',str(cleaned)]+source_args
+        vf=[blur_graph(','.join(vf) or 'null',[b for b in boxes if b.get('mode')!='text'],duration)]
         # libass loads the font from its own folder, so it does not depend on the system font setup (fontconfig on Windows).
         title_font=font_path(cfg.get('title_font',''));caption_font=font_path(cfg.get('caption_font',''))
         fonts=run/'fonts';fonts.mkdir()
@@ -591,8 +646,9 @@ def render(p):
         vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"ass=filename={filter_path(run/'overlay.ass')}:fontsdir={filter_path(fonts)}"])
         (run/'captions.srt').write_text(srt,encoding='utf-8')
         output=run/'short.mp4'
-        command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-ss',str(cfg['start']),'-threads','2','-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source),'-t',str(duration),'-map','0:v:0']
-        if not cfg['mute']:command+=['-map','0:a:0?']
+        audio=1 if letters else 0
+        command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args,'-t',str(duration),'-map','0:v:0']
+        if not cfg['mute']:command+=['-map',f'{audio}:a:0?']
         command+=['-vf',','.join(vf),'-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
         subprocess.run(command,capture_output=True,timeout=480,check=True)
         result=probe(output)

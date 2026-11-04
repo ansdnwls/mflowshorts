@@ -180,6 +180,10 @@ else {
         $ytdlp = Get-FirstLine $VenvPython @('-m', 'yt_dlp', '--version')
         if ($ytdlp) { Add-Result '미디어 가상환경' 'OK' "yt-dlp $ytdlp ($VenvPython)" }
         elseif (-not ($Results | Where-Object { $_.항목 -eq '미디어 가상환경' })) { Add-Result '미디어 가상환경' '실패' 'yt-dlp를 실행하지 못했습니다.' }
+        # 글자만 지우기(정밀): text_eraser.py가 이 가상환경의 OpenCV를 씁니다.
+        $cv = Get-FirstLine $VenvPython @('-c', 'import cv2; print(cv2.__version__)')
+        if ($cv) { Add-Result '글자 지우기(OpenCV)' 'OK' "OpenCV $cv" }
+        else { Add-Result '글자 지우기(OpenCV)' '경고' '아직 없습니다. -CheckOnly 없이 이 스크립트를 실행하면 설치됩니다.' }
     }
     elseif (-not $CheckOnly) { Add-Result '미디어 가상환경' '실패' 'Python이 없어 가상환경을 만들지 못했습니다.' }
 
