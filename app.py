@@ -215,7 +215,7 @@ def save_external_video(video):
 
 def start_media_job(data):
     task=validate_media_task(data)
-    if not MEDIA_PYTHON.is_file(): raise ValueError('미디어 도구를 먼저 설치하세요. scripts/install_media.sh를 실행하면 됩니다.')
+    if not MEDIA_PYTHON.is_file(): raise ValueError('미디어 도구를 먼저 설치하세요. '+(r'Windows는 scripts\install_windows.cmd' if os.name=='nt' else 'scripts/install_media.sh')+'를 실행하면 됩니다.')
     job_id=uuid.uuid4().hex
     now=dt.datetime.now(UTC).isoformat()
     with MEDIA_LOCK:
