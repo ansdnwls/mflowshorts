@@ -1,4 +1,6 @@
 import io
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 import unittest
@@ -116,6 +118,28 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual((cfg['title_y'],cfg['comment_y'],cfg['caption_y']),(15,-40,0))
         for bad in (301,-301,'x',float('nan')):
             with self.subTest(bad=bad),self.assertRaises(ValueError):production.settings({'caption_y':bad})
+    def test_blur_boxes(self):
+        boxes=production.blurs([{'x':0.05,'y':0.6,'w':2,'h':0.1},{'x':0.5,'y':0.5,'w':0.001,'h':0.001},{'x':0,'y':0,'w':0.5,'h':0.1,'start':1,'end':3}])
+        self.assertEqual(len(boxes),2)  # the tiny one is dropped
+        self.assertAlmostEqual(boxes[0]['w'],0.95)  # clamped to the frame
+        for bad in ('x',[{'x':'a'}],[{'x':0,'y':0,'w':0.5,'h':0.5,'start':3,'end':2}],[{'x':0,'y':0,'w':0.5,'h':0.5}]*7):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):production.blurs(bad)
+        graph=production.blur_graph('scale=1080:1920',boxes,5)
+        self.assertEqual(graph.count('boxblur='),2)
+        self.assertIn("enable='between(t,1.0,3.0)'",graph);self.assertIn("enable='between(t,0.0,6)'",graph)
+        self.assertTrue(graph.endswith('[v2]null'))
+        self.assertEqual(production.blur_graph('scale=1080:1920',[],5),'scale=1080:1920')
+        base={'source':{'filename':'a.mp4'},'script':'s','headline':'h','settings':production.default_settings()}
+        self.assertEqual(production.fingerprint(base),production.fingerprint({**base,'blurs':[]}))
+        self.assertNotEqual(production.fingerprint(base),production.fingerprint({**base,'blurs':boxes}))
+        production.update_project({'id':self.ident,'blurs':boxes})
+        self.assertEqual(production.project(self.ident)['document']['blurs'],boxes)
+    @unittest.skipUnless(shutil.which('ffmpeg'),'needs ffmpeg')
+    def test_blur_graph_runs_in_ffmpeg(self):
+        boxes=production.blurs([{'x':0.05,'y':0.6,'w':0.9,'h':0.1},{'x':0.1,'y':0.3,'w':0.3,'h':0.05,'start':0.2,'end':0.6}])
+        graph=production.blur_graph(','.join(production.layout_filters('band')),boxes,1)+',drawbox=x=0:y=0:w=iw:h=10:color=black:t=fill'
+        result=subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=640x360:rate=10','-t','1','-vf',graph,'-f','null','-'],capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
     def test_rendering_project_cannot_be_edited(self):
         p=production.project(self.ident);p['status']='rendering';production.store(p)
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'script':'edit'})

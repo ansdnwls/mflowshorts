@@ -208,7 +208,7 @@ def update_project(data):
     script=str(data.get('script',doc['script'])).strip();headline=str(data.get('headline',doc['headline'])).strip()
     context=str(data.get('context',doc.get('context',''))).strip()
     source_url=str(data.get('source_url',doc.get('source_url',''))).strip()
-    credit=re.sub(r'\s+',' ',str(data.get('credit',doc.get('credit','')))).strip();cards=comments(data.get('comments',doc.get('comments',[])))
+    credit=re.sub(r'\s+',' ',str(data.get('credit',doc.get('credit','')))).strip();cards=comments(data.get('comments',doc.get('comments',[])));boxes=blurs(data.get('blurs',doc.get('blurs',[])))
     if len(credit)>60:raise ValueError('출처 표시는 60자 이내로 입력하세요.')
     if len(textwrap.wrap(headline,18))>3:raise ValueError('상단 제목은 화면에서 3줄(약 50자) 이내여야 합니다. 줄여서 입력하세요.')
     if not title or len(title)>100 or not headline or len(headline)>60 or len(script)>800 or len(context)>2000 or len(source_url)>2048:raise ValueError('이름 100자·상단 제목 60자·대본 800자·맥락 메모 2000자 이내로 입력하세요.')
@@ -216,7 +216,7 @@ def update_project(data):
         from urllib.parse import urlsplit
         u=urlsplit(source_url)
         if u.scheme!='https' or not u.hostname or u.username or u.password:raise ValueError('출처는 HTTPS 링크로 입력하세요.')
-    p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'credit_on':bool(data.get('credit_on',doc.get('credit_on',True))),'comments':cards,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
+    p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'credit_on':bool(data.get('credit_on',doc.get('credit_on',True))),'comments':cards,'blurs':boxes,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
     doc.pop('output',None);doc.pop('archive',None)
     p['status']='script_ready' if script and doc['source'] else 'source_ready' if doc['source'] else 'draft'
     doc['message']='대본과 설정을 검토한 뒤 승인하세요.' if p['status']=='script_ready' else '원본과 대본을 준비하세요.'
@@ -269,9 +269,41 @@ def save_source(project_id,path,info):
 def fingerprint(doc):
     # credit/comments only count when set, so projects approved before they existed stay approved.
     data={k:doc.get(k) for k in ('source','script','headline','settings')}
-    data.update({k:doc[k] for k in ('credit','comments') if doc.get(k)})
+    data.update({k:doc[k] for k in ('credit','comments','blurs') if doc.get(k)})
     if doc.get('credit_on') is False:data['credit_on']=False
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+
+MAX_BLURS=6
+def blurs(value):
+    """Validate blur boxes that hide text burned into the source: {'x','y','w','h'} as 0~1 of the 1080x1920 frame, 'start'/'end' seconds (end 0 = to the end)."""
+    if not isinstance(value,list) or len(value)>MAX_BLURS:raise ValueError(f'블러 박스는 최대 {MAX_BLURS}개입니다.')
+    result=[]
+    for item in value:
+        if not isinstance(item,dict):raise ValueError('블러 박스 형식을 확인하세요.')
+        try:box={k:float(item.get(k) or 0) for k in ('x','y','w','h','start','end')}
+        except (TypeError,ValueError):raise ValueError('블러 박스 값은 숫자로 입력하세요.') from None
+        if not all(math.isfinite(v) for v in box.values()):raise ValueError('블러 박스 값은 숫자로 입력하세요.')
+        box['x'],box['y']=min(max(box['x'],0),1),min(max(box['y'],0),1)
+        box['w'],box['h']=min(max(box['w'],0),1-box['x']),min(max(box['h'],0),1-box['y'])
+        if box['w']*WIDTH<16 or box['h']*HEIGHT<16:continue  # too small to matter
+        if not 0<=box['start']<=60 or not 0<=box['end']<=60 or (box['end'] and box['end']<=box['start']):raise ValueError('블러 시간은 0~60초이고, 끝 시간은 시작보다 뒤여야 합니다(0이면 끝까지).')
+        result.append({k:round(v,4) for k,v in box.items()})
+    return result
+
+
+def blur_graph(chain,boxes,duration):
+    """Filter graph that blurs each box on the laid-out frame, before the title and captions are drawn on top."""
+    if not boxes:return chain
+    graph=[f'{chain}[v0]']
+    for i,box in enumerate(boxes):
+        x,y=round(box['x']*WIDTH)//2*2,round(box['y']*HEIGHT)//2*2
+        w,h=max(16,round(box['w']*WIDTH)//2*2),max(16,round(box['h']*HEIGHT)//2*2)
+        w,h=min(w,WIDTH-x),min(h,HEIGHT-y)
+        radius=max(2,min(px(14),min(w,h)//4-1))  # boxblur needs radius <= half the (chroma) size
+        end=box['end'] or duration+1
+        graph.append(f"[v{i}]split[m{i}][s{i}];[s{i}]crop={w}:{h}:{x}:{y},boxblur={radius}:3[b{i}];[m{i}][b{i}]overlay={x}:{y}:enable='between(t,{box['start']},{end})'[v{i+1}]")
+    return ';'.join(graph)+f';[v{len(boxes)}]null'
 
 
 def comments(value):
@@ -454,6 +486,7 @@ def render(p):
         style=STYLES[cfg['style']]
         vf=layout_filters(cfg.get('layout','fill'))
         if cfg['mirror']:vf.append('hflip')
+        vf=[blur_graph(','.join(vf),doc.get('blurs') or [],duration)]
         # libass loads the font from its own folder, so it does not depend on the system font setup (fontconfig on Windows).
         title_font=font_path(cfg.get('title_font',''));caption_font=font_path(cfg.get('caption_font',''))
         fonts=run/'fonts';fonts.mkdir()
@@ -469,7 +502,7 @@ def render(p):
         subprocess.run(command,capture_output=True,timeout=480,check=True)
         result=probe(output)
         if result['width']!=WIDTH or result['height']!=HEIGHT:raise ValueError('render size')
-        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','approved_hash':doc['approved_hash']}
+        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','blurs':doc.get('blurs') or [],'approved_hash':doc['approved_hash']}
         (run/'project.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
         with zipfile.ZipFile(run/'project.zip','w',compression=zipfile.ZIP_STORED) as archive:
             for name in ('short.mp4','captions.srt','project.json'):archive.write(run/name,name)

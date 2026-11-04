@@ -31,3 +31,16 @@
 .offset-row output{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
 .offset-actions{display:flex;justify-content:space-between;align-items:center;gap:8px}
 .offset-actions button{font-size:12px;padding:4px 10px;white-space:nowrap}
+#preview-blurs{position:absolute;inset:0;pointer-events:none}
+.blur-box{position:absolute;box-sizing:border-box;border:1.5px dashed #ffe34a;backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px);background:#ffffff14;pointer-events:auto;cursor:move;touch-action:none}
+.blur-box span{position:absolute;left:2px;top:1px;font-size:9px;color:#ffe34a;text-shadow:0 0 2px #000}
+.blur-box i{position:absolute;right:-5px;bottom:-5px;width:12px;height:12px;background:#ffe34a;border-radius:3px;cursor:nwse-resize}
+.blur-panel{border:1px solid var(--line);border-radius:9px;padding:10px 14px;display:grid;gap:8px;margin:10px 0}
+.blur-panel legend{font-size:12px;padding:0 4px}
+.blur-panel .hint{margin:0}
+.blur-row{display:grid;grid-template-columns:60px 1fr 1fr auto;gap:6px;align-items:center;font-size:12px}
+.blur-row label{display:flex;align-items:center;gap:4px;font-size:12px}
+.blur-row input{width:100%;min-width:0}
+.blur-row button,#blur-add{font-size:12px;padding:4px 10px;white-space:nowrap}
+#production-form #blur-list .blur-row label{white-space:nowrap;display:flex;flex-direction:row;align-items:center;gap:4px;margin:0;font-size:12px}
+#production-form #blur-list .blur-row input{padding:6px 8px}
