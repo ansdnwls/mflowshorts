@@ -69,7 +69,7 @@ def store(p):
     with CONNECT() as con: con.execute('UPDATE production_projects SET title=?,channel_id=?,status=?,document=?,updated_at=? WHERE id=?',(p['title'],p['channel_id'],p['status'],json.dumps(p['document'],ensure_ascii=False),now(),p['id']))
 
 
-def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'fill','title_font':'','caption_font':''}
+def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'band','title_font':'','caption_font':''}
 
 
 def available_fonts():
@@ -94,25 +94,34 @@ def font_path(name):
 # Every size below was designed on a 720x1280 canvas and is scaled by SCALE (1.5) so the look stays the same.
 SCALE=1.5
 def px(value):return round(value*SCALE)
-WIDTH,HEIGHT,TITLE_HEIGHT,CAPTION_TOP=px(720),px(1280),px(230),px(1060)
+# Usual shorts frame: black band with the title on top, video in the middle, black band at the bottom.
+WIDTH,HEIGHT,TITLE_HEIGHT,VIDEO_BOTTOM=px(720),px(1280),px(300),px(1000)
 # Headline sizes, tried in order: (characters per line, font size, max lines). Big two-line titles first.
 TITLE_FITS=[(9,px(72),2),(12,px(54),2),(18,px(35),3)]
 TITLE_OUTLINE=px(5)
-# Narration captions: bold white text with a thick outline, bottom edge at CAPTION_BOTTOM.
-CAPTION_FONT,CAPTION_LINE_CHARS,CAPTION_BOTTOM,CAPTION_OUTLINE=px(50),12,px(1160),px(6)
-LAYOUTS={'fill':'화면 꽉 채우기','fit':'원본 맞추기'}
+# Narration captions: bold white text with a thick outline. Bottom edge near the bottom of the video.
+CAPTION_FONT,CAPTION_LINE_CHARS,CAPTION_OUTLINE=px(50),12,px(6)
+CAPTION_BOTTOM={'band':VIDEO_BOTTOM-px(18),'fit':VIDEO_BOTTOM-px(18),'fill':px(1160)}
+# Small source/credit line right above the video, e.g. "에이티즈 - Drip / 출처. Jennifer Hudson Show".
+CREDIT_FONT=px(22)
+# Comment cards: white rounded card, nickname line + comment text.
+COMMENT_MARGIN,COMMENT_PAD,COMMENT_NAME_FONT,COMMENT_FONT,COMMENT_LINE_CHARS=px(36),px(20),px(22),px(29),20
+COMMENT_TOP={'band':VIDEO_BOTTOM+px(22),'fit':VIDEO_BOTTOM+px(22),'fill':TITLE_HEIGHT+px(24)}
+LAYOUTS={'band':'위아래 검정','fill':'화면 꽉 채우기','fit':'원본 맞추기'}
 
 
 def layout_filters(layout):
     """Video filters that place the source on the canvas without the title band hiding it.
 
-    fill: crop the source to cover everything below the title band (captions sit on the video).
-    fit: show the whole source between the title and caption areas, over a blurred copy of itself.
+    band: crop the source to fill the middle between the black title band and a black bottom band.
+    fill: crop the source to cover everything below the title band.
+    fit: show the whole source in the middle area on black.
     """
+    area=VIDEO_BOTTOM-TITLE_HEIGHT
+    if layout=='band':
+        return [f'scale={WIDTH}:{area}:force_original_aspect_ratio=increase',f'crop={WIDTH}:{area}','setsar=1',f'pad={WIDTH}:{HEIGHT}:0:{TITLE_HEIGHT}:black']
     if layout=='fit':
-        area=CAPTION_TOP-TITLE_HEIGHT
-        return [f'split[bg][fg];[bg]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},boxblur={px(20)}:2,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.45:t=fill[back];'
-                f'[fg]scale={WIDTH}:{area}:force_original_aspect_ratio=decrease,setsar=1[front];[back][front]overlay=x=(W-w)/2:y={TITLE_HEIGHT}+({area}-h)/2','setsar=1']
+        return [f'scale={WIDTH}:{area}:force_original_aspect_ratio=decrease','setsar=1',f'pad={WIDTH}:{HEIGHT}:(ow-iw)/2:{TITLE_HEIGHT}+({area}-ih)/2:black']
     area=HEIGHT-TITLE_HEIGHT
     return [f'scale={WIDTH}:{area}:force_original_aspect_ratio=increase',f'crop={WIDTH}:{area}','setsar=1',f'pad={WIDTH}:{HEIGHT}:0:{TITLE_HEIGHT}:black']
 
@@ -167,13 +176,15 @@ def update_project(data):
     script=str(data.get('script',doc['script'])).strip();headline=str(data.get('headline',doc['headline'])).strip()
     context=str(data.get('context',doc.get('context',''))).strip()
     source_url=str(data.get('source_url',doc.get('source_url',''))).strip()
+    credit=re.sub(r'\s+',' ',str(data.get('credit',doc.get('credit','')))).strip();cards=comments(data.get('comments',doc.get('comments',[])))
+    if len(credit)>60:raise ValueError('출처 표시는 60자 이내로 입력하세요.')
     if len(textwrap.wrap(headline,18))>3:raise ValueError('상단 제목은 화면에서 3줄(약 50자) 이내여야 합니다. 줄여서 입력하세요.')
     if not title or len(title)>100 or not headline or len(headline)>60 or len(script)>800 or len(context)>2000 or len(source_url)>2048:raise ValueError('이름 100자·상단 제목 60자·대본 800자·맥락 메모 2000자 이내로 입력하세요.')
     if source_url:
         from urllib.parse import urlsplit
         u=urlsplit(source_url)
         if u.scheme!='https' or not u.hostname or u.username or u.password:raise ValueError('출처는 HTTPS 링크로 입력하세요.')
-    p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
+    p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'comments':cards,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
     doc.pop('output',None);doc.pop('archive',None)
     p['status']='script_ready' if script and doc['source'] else 'source_ready' if doc['source'] else 'draft'
     doc['message']='대본과 설정을 검토한 뒤 승인하세요.' if p['status']=='script_ready' else '원본과 대본을 준비하세요.'
@@ -224,7 +235,25 @@ def save_source(project_id,path,info):
 
 
 def fingerprint(doc):
-    return hashlib.sha256(json.dumps({k:doc.get(k) for k in ('source','script','headline','settings')},sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+    # credit/comments only count when set, so projects approved before they existed stay approved.
+    data={k:doc.get(k) for k in ('source','script','headline','settings')}
+    data.update({k:doc[k] for k in ('credit','comments') if doc.get(k)})
+    return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+
+def comments(value):
+    """Validate up to 3 comment cards: {'name','when','text','at'}. Rows without text are dropped."""
+    if not isinstance(value,list):raise ValueError('댓글 형식을 확인하세요.')
+    result=[]
+    for item in value[:3]:
+        if not isinstance(item,dict):raise ValueError('댓글 형식을 확인하세요.')
+        text=re.sub(r'\s+',' ',str(item.get('text',''))).strip();name=str(item.get('name','')).strip();when=str(item.get('when','')).strip()
+        if not text:continue
+        try:at=float(item.get('at') or 0)
+        except (TypeError,ValueError):raise ValueError('댓글 표시 시작 시간을 숫자로 입력하세요.') from None
+        if len(text)>80 or len(name)>30 or len(when)>15 or not math.isfinite(at) or not 0<=at<=60:raise ValueError('댓글은 80자, 닉네임 30자, 시간 표시 15자, 표시 시작 0~60초 이내로 입력하세요.')
+        result.append({'name':name,'when':when,'text':text,'at':at})
+    return sorted(result,key=lambda c:c['at'])
 
 
 @serialized
@@ -322,23 +351,54 @@ def ass_font(path):
     return family,-1 if weight>=600 else 0
 
 
-def subtitles(doc,style,duration,captions,title_font=None,caption_font=None):
+def rounded_box(w,h,r):
+    """ASS vector drawing of a w x h rectangle with rounded corners."""
+    return f'm {r} 0 l {w-r} 0 b {w} 0 {w} 0 {w} {r} l {w} {h-r} b {w} {h} {w} {h} {w-r} {h} l {r} {h} b 0 {h} 0 {h} 0 {h-r} l 0 {r} b 0 0 0 0 {r} 0'
+
+
+def comment_events(cards,layout,duration):
+    """Comment cards, each shown from its 'at' time until the next card (or the end)."""
+    events=[];top=COMMENT_TOP.get(layout,COMMENT_TOP['band']);width=WIDTH-2*COMMENT_MARGIN;left=COMMENT_MARGIN
+    for index,card in enumerate(cards):
+        start=min(card['at'],duration);end=cards[index+1]['at'] if index+1<len(cards) else duration+1
+        if end<=start:continue
+        lines=textwrap.wrap(card['text'],COMMENT_LINE_CHARS)[:3];name=card['name']
+        if name and not name.startswith('@'):name='@'+name
+        header=' · '.join(x for x in (name,card['when']) if x)
+        header_h=round(COMMENT_NAME_FONT*1.5) if header else 0
+        height=2*COMMENT_PAD+header_h+round(len(lines)*COMMENT_FONT*1.3)
+        span=f'{ass_time(start)},{ass_time(end)}'
+        events.append(f'Dialogue: 1,{span},Card,,0,0,0,,{{\\an7\\pos({left},{top})\\p1}}{rounded_box(width,height,px(12))}{{\\p0}}')
+        y=top+COMMENT_PAD
+        if header:events.append(f'Dialogue: 2,{span},CommentName,,0,0,0,,{{\\an7\\pos({left+COMMENT_PAD},{y})}}{ass_text(header)}');y+=header_h
+        events.append(f'Dialogue: 2,{span},Comment,,0,0,0,,{{\\an7\\pos({left+COMMENT_PAD},{y})}}'+r'\N'.join(ass_text(line) for line in lines))
+    return events
+
+
+def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layout='band'):
     """Build the ASS subtitle file (headline + narration captions) and the matching SRT text."""
     lines,size=title_lines(doc['headline'])
     title=r'\N'.join(('{\\c'+ass_color(style['title' if i==0 else 'title2'])+'}')+ass_text(line) for i,line in enumerate(lines))
-    title_family,title_bold=ass_font(title_font or FONT);caption_family,caption_bold=ass_font(caption_font or FONT)
+    title_family,title_bold=ass_font(title_font or FONT);caption_family,caption_bold=ass_font(caption_font or FONT);ui_family,ui_bold=ass_font(FONT)
+    credit=doc.get('credit','');title_bottom=TITLE_HEIGHT-(px(46) if credit else px(26))
     ass=['[Script Info]','ScriptType: v4.00+',f'PlayResX: {WIDTH}',f'PlayResY: {HEIGHT}','WrapStyle: 2','ScaledBorderAndShadow: yes','',
          '[V4+ Styles]','Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-         f'Style: Title,{title_family},{size},{ass_color(style["title"])},&H000000FF&,&H00000000&,&H00000000&,{title_bold},0,0,0,100,100,0,0,1,{TITLE_OUTLINE},0,5,0,0,0,1',
+         f'Style: Title,{title_family},{size},{ass_color(style["title"])},&H000000FF&,&H00000000&,&H00000000&,{title_bold},0,0,0,100,100,0,0,1,{TITLE_OUTLINE},0,2,0,0,0,1',
          f'Style: Caption,{caption_family},{CAPTION_FONT},{ass_color(style["caption"])},&H000000FF&,&H00000000&,&H80000000&,{caption_bold},0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},{px(2)},2,0,0,0,1',
+         f'Style: Credit,{ui_family},{CREDIT_FONT},&H00D8D8D8&,&H000000FF&,&H00000000&,&H00000000&,0,0,0,0,100,100,0,0,1,{px(1)},0,2,0,0,0,1',
+         f'Style: Card,{ui_family},20,&H00FFFFFF&,&H000000FF&,&H00000000&,&H60000000&,0,0,0,0,100,100,0,0,1,0,{px(3)},7,0,0,0,1',
+         f'Style: CommentName,{ui_family},{COMMENT_NAME_FONT},&H00707070&,&H000000FF&,&H00000000&,&H00000000&,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
+         f'Style: Comment,{ui_family},{COMMENT_FONT},&H00141414&,&H000000FF&,&H00000000&,&H00000000&,{ui_bold},0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
          '','[Events]','Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
-         f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT//2})}}{title}']
+         f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{title_bottom})}}{title}']
+    if credit:ass.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Credit,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT-px(12)})}}{ass_text(credit)}')
+    ass.extend(comment_events(doc.get('comments') or [],layout,duration))
     srt=[];chunks=caption_chunks(doc['script'])
     for index,chunk in enumerate(chunks):
         start=duration*index/len(chunks);end=duration*(index+1)/len(chunks)
         srt.extend([str(index+1),f'{srt_time(start)} --> {srt_time(end)}','\n'.join(' '.join(w for w,_ in line) for line in chunk),''])
         text=r'\N'.join(' '.join(('{\\c'+ass_color(style['highlight'])+'}'+ass_text(w)+'{\\c'+ass_color(style['caption'])+'}') if marked else ass_text(w) for w,marked in line) for line in chunk)
-        if captions:ass.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{{\\pos({WIDTH//2},{CAPTION_BOTTOM})}}{text}')
+        if captions:ass.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{{\\pos({WIDTH//2},{CAPTION_BOTTOM.get(layout,CAPTION_BOTTOM['band'])})}}{text}')
     return '\n'.join(ass)+'\n','\n'.join(srt)
 
 
@@ -363,8 +423,8 @@ def render(p):
         # libass loads the font from its own folder, so it does not depend on the system font setup (fontconfig on Windows).
         title_font=font_path(cfg.get('title_font',''));caption_font=font_path(cfg.get('caption_font',''))
         fonts=run/'fonts';fonts.mkdir()
-        for path in {title_font,caption_font}:shutil.copyfile(path,fonts/path.name)
-        ass,srt=subtitles(doc,style,duration,cfg['captions'],title_font,caption_font)
+        for path in {title_font,caption_font,Path(FONT)}:shutil.copyfile(path,fonts/path.name)
+        ass,srt=subtitles(doc,style,duration,cfg['captions'],title_font,caption_font,cfg.get('layout','fill'))
         (run/'overlay.ass').write_text(ass,encoding='utf-8')
         vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"ass=filename={filter_path(run/'overlay.ass')}:fontsdir={filter_path(fonts)}"])
         (run/'captions.srt').write_text(srt,encoding='utf-8')

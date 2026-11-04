@@ -38,13 +38,15 @@ class ProductionTests(unittest.TestCase):
         for key,value in [('duration',float('nan')),('start',float('inf')),('duration',1000),('mirror','true')]:
             with self.subTest(key=key),self.assertRaises(ValueError):production.settings({key:value})
     def test_layout_setting(self):
-        self.assertEqual(production.settings({})['layout'],'fill')
+        self.assertEqual(production.settings({})['layout'],'band')
         self.assertEqual(production.settings({'layout':'fit'})['layout'],'fit')
         with self.assertRaises(ValueError):production.settings({'layout':'stretch'})
     def test_layout_keeps_video_clear_of_title_band(self):
-        fill=','.join(production.layout_filters('fill'));fit=','.join(production.layout_filters('fit'))
+        area=production.VIDEO_BOTTOM-production.TITLE_HEIGHT
+        band,fill,fit=(','.join(production.layout_filters(name)) for name in ('band','fill','fit'))
+        self.assertIn(f'crop=1080:{area}',band);self.assertIn(f'pad=1080:1920:0:{production.TITLE_HEIGHT}:black',band)
         self.assertIn(f'pad=1080:1920:0:{production.TITLE_HEIGHT}',fill)
-        self.assertIn(f'scale=1080:{production.CAPTION_TOP-production.TITLE_HEIGHT}:force_original_aspect_ratio=decrease',fit)
+        self.assertIn(f'scale=1080:{area}:force_original_aspect_ratio=decrease',fit)
     def test_subtitles_two_color_title_and_highlight(self):
         style=production.STYLES['basic']
         with patch.object(production,'font_info',return_value=('Test Font',700)):
@@ -71,6 +73,21 @@ class ProductionTests(unittest.TestCase):
             ass,_=production.subtitles({'headline':'제목','script':'대본'},production.STYLES['basic'],5,True,fonts/'Display.ttf',fonts/'Display.ttf')
         self.assertIn('Style: Title,Display Font,',ass)
         self.assertIn('&H00000000&,0,0,0,0,100',ass)  # regular-weight display font is not fake-bolded
+    def test_comment_cards_and_credit(self):
+        cards=production.comments([{'name':'봄날','when':'15시간 전','text':' 와  반응 미쳤다 ','at':'3'},{'text':'','at':0},{'name':'','when':'','text':'처음엔 몰랐어요','at':0}])
+        self.assertEqual([c['text'] for c in cards],['처음엔 몰랐어요','와 반응 미쳤다'])
+        for bad in ([{'text':'가'*81}],[{'text':'a','at':'x'}],[{'text':'a','at':99}],'nope'):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):production.comments(bad)
+        with patch.object(production,'font_info',return_value=('Test Font',700)):
+            ass,_=production.subtitles({'headline':'제목','script':'대본','credit':'에이티즈 - Drip','comments':cards},production.STYLES['basic'],10,True)
+        self.assertIn(',Credit,,',ass);self.assertIn('에이티즈 - Drip',ass)
+        self.assertIn('0:00:00.00,0:00:03.00,Comment,,',ass);self.assertNotIn('0:00:00.00,0:00:03.00,CommentName',ass)  # first card has no name line
+        self.assertIn('@봄날 · 15시간 전',ass)
+        self.assertEqual(ass.count(',Card,,'),2)
+    def test_credit_and_comments_keep_old_approvals(self):
+        doc={'source':{'filename':'a.mp4'},'script':'s','headline':'h','settings':production.default_settings()}
+        self.assertEqual(production.fingerprint(doc),production.fingerprint({**doc,'credit':'','comments':[]}))
+        self.assertNotEqual(production.fingerprint(doc),production.fingerprint({**doc,'credit':'출처'}))
     def test_rendering_project_cannot_be_edited(self):
         p=production.project(self.ident);p['status']='rendering';production.store(p)
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'script':'edit'})
