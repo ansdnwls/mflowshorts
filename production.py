@@ -158,6 +158,11 @@ def create_channel(data):
     return ident
 
 
+def shown_credit(doc):
+    """The credit text that goes on screen; empty when the user switched it off."""
+    return doc.get('credit','') if doc.get('credit_on',True) else ''
+
+
 def credit_line(channel):
     """Default credit under the title: '출처. 채널명' (60 characters at most)."""
     name=re.sub(r'\s+',' ',str(channel or '')).strip()
@@ -203,7 +208,7 @@ def update_project(data):
         from urllib.parse import urlsplit
         u=urlsplit(source_url)
         if u.scheme!='https' or not u.hostname or u.username or u.password:raise ValueError('출처는 HTTPS 링크로 입력하세요.')
-    p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'comments':cards,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
+    p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'credit_on':bool(data.get('credit_on',doc.get('credit_on',True))),'comments':cards,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
     doc.pop('output',None);doc.pop('archive',None)
     p['status']='script_ready' if script and doc['source'] else 'source_ready' if doc['source'] else 'draft'
     doc['message']='대본과 설정을 검토한 뒤 승인하세요.' if p['status']=='script_ready' else '원본과 대본을 준비하세요.'
@@ -257,6 +262,7 @@ def fingerprint(doc):
     # credit/comments only count when set, so projects approved before they existed stay approved.
     data={k:doc.get(k) for k in ('source','script','headline','settings')}
     data.update({k:doc[k] for k in ('credit','comments') if doc.get(k)})
+    if doc.get('credit_on') is False:data['credit_on']=False
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 
@@ -399,7 +405,7 @@ def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layo
     lines,size=title_lines(doc['headline'])
     title=r'\N'.join(('{\\c'+ass_color(style['title' if i==0 else 'title2'])+'}')+ass_text(line) for i,line in enumerate(lines))
     title_family,title_bold=ass_font(title_font or FONT);caption_family,caption_bold=ass_font(caption_font or FONT);ui_family,ui_bold=ass_font(FONT)
-    credit=doc.get('credit','');title_bottom=TITLE_HEIGHT-(px(46) if credit else px(26))
+    credit=shown_credit(doc);title_bottom=TITLE_HEIGHT-(px(46) if credit else px(26))
     ass=['[Script Info]','ScriptType: v4.00+',f'PlayResX: {WIDTH}',f'PlayResY: {HEIGHT}','WrapStyle: 2','ScaledBorderAndShadow: yes','',
          '[V4+ Styles]','Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
          f'Style: Title,{title_family},{size},{ass_color(style["title"])},&H000000FF&,&H00000000&,&H00000000&,{title_bold},0,0,0,100,100,0,0,1,{TITLE_OUTLINE},0,2,0,0,0,1',

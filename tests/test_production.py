@@ -88,6 +88,17 @@ class ProductionTests(unittest.TestCase):
         doc={'source':{'filename':'a.mp4'},'script':'s','headline':'h','settings':production.default_settings()}
         self.assertEqual(production.fingerprint(doc),production.fingerprint({**doc,'credit':'','comments':[]}))
         self.assertNotEqual(production.fingerprint(doc),production.fingerprint({**doc,'credit':'출처'}))
+    def test_credit_can_be_switched_off(self):
+        doc={'headline':'제목','script':'대본','credit':'출처. 채널','credit_on':False}
+        with patch.object(production,'font_info',return_value=('Test Font',700)):
+            ass,_=production.subtitles(doc,production.STYLES['basic'],10,True)
+        self.assertNotIn(',Credit,,',ass)
+        base={'source':{'filename':'a.mp4'},'script':'s','headline':'h','settings':production.default_settings(),'credit':'출처'}
+        self.assertEqual(production.fingerprint(base),production.fingerprint({**base,'credit_on':True}))
+        self.assertNotEqual(production.fingerprint(base),production.fingerprint({**base,'credit_on':False}))
+        production.update_project({'id':self.ident,'credit':'출처. 채널','credit_on':False})
+        doc=production.project(self.ident)['document']
+        self.assertEqual((doc['credit'],doc['credit_on']),('출처. 채널',False))  # text kept for switching back on
     def test_rendering_project_cannot_be_edited(self):
         p=production.project(self.ident);p['status']='rendering';production.store(p)
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'script':'edit'})

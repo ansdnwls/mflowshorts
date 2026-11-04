@@ -22,3 +22,5 @@
 .comment-row input.needs-translation{border-color:#f0a24a;background:#fff8ef}
 .project-card .comment-ready{margin:0 6px 4px 0}
 .comment-clear{font-size:12px;padding:4px 10px;white-space:nowrap}
+.credit-field{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}
+.credit-toggle{white-space:nowrap;padding-bottom:10px}
