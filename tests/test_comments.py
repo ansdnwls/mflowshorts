@@ -23,6 +23,9 @@ class PickerTests(unittest.TestCase):
             self.assertEqual(comment_picker.youtube_id(url), 'dQw4w9WgXcQ')
         for url in ('https://www.tiktok.com/@a/video/1', 'https://evil.example/watch?v=dQw4w9WgXcQ', '', None, 'https://www.youtube.com/watch?v=short'):
             self.assertEqual(comment_picker.youtube_id(url), '')
+    def test_most_liked_first(self):
+        result = comment_picker.from_youtube([thread('왜 그런 거지?', 5), thread('just a normal comment', 900), thread('진짜 웃기다 ㅋㅋ', 50)], NOW)
+        self.assertEqual([c['likes'] for c in result['comments']], [900, 50, 5])
     def test_labels(self):
         self.assertEqual(comment_picker.time_ago('2026-11-04T00:00:00Z', NOW), '12시간 전')
         self.assertEqual(comment_picker.time_ago('2026-10-31T12:00:00Z', NOW), '4일 전')
