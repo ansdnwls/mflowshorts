@@ -81,7 +81,10 @@ def store(p):
     with CONNECT() as con: con.execute('UPDATE production_projects SET title=?,channel_id=?,status=?,document=?,updated_at=? WHERE id=?',(p['title'],p['channel_id'],p['status'],json.dumps(p['document'],ensure_ascii=False),now(),p['id']))
 
 
-def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'band','title_font':'','caption_font':''}
+def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'band','title_font':'','caption_font':'',**{k:0 for k in OFFSETS}}
+# Up/down nudges set in the editor, in 720x1280 design pixels (positive = lower). Saved with the channel template.
+OFFSETS=('title_y','credit_y','caption_y','comment_y')
+OFFSET_LIMIT=300
 
 
 def available_fonts():
@@ -145,6 +148,11 @@ def settings(data):
     if not math.isfinite(result['duration']) or not 1<=result['duration']<=60 or not math.isfinite(result['start']) or not 0<=result['start']<=5400:raise ValueError('길이는 1~60초, 시작은 0~5400초입니다.')
     fonts={f['file'] for f in available_fonts()}
     if any(not isinstance(result[k],str) or (result[k] and result[k] not in fonts) for k in ('title_font','caption_font')):raise ValueError('글씨체를 다시 선택하세요. fonts 폴더에 파일이 있어야 합니다.')
+    try:
+        for k in OFFSETS:
+            result[k]=int(round(float(result[k])))
+            if not -OFFSET_LIMIT<=result[k]<=OFFSET_LIMIT:raise ValueError
+    except (ValueError,TypeError,OverflowError):raise ValueError(f'위치 조정은 -{OFFSET_LIMIT}~{OFFSET_LIMIT} 사이로 입력하세요.') from None
     if result['style'] not in STYLES or result['layout'] not in LAYOUTS or any(type(result[k]) is not bool for k in ('mute','mirror','captions')):raise ValueError('스타일 설정을 확인하세요.')
     return result
 
@@ -381,9 +389,9 @@ def rounded_box(w,h,r):
     return f'm {r} 0 l {w-r} 0 b {w} 0 {w} 0 {w} {r} l {w} {h-r} b {w} {h} {w} {h} {w-r} {h} l {r} {h} b 0 {h} 0 {h} 0 {h-r} l 0 {r} b 0 0 0 0 {r} 0'
 
 
-def comment_events(cards,layout,duration):
+def comment_events(cards,layout,duration,shift=0):
     """Comment cards, each shown from its 'at' time until the next card (or the end)."""
-    events=[];top=COMMENT_TOP.get(layout,COMMENT_TOP['band']);width=WIDTH-2*COMMENT_MARGIN;left=COMMENT_MARGIN
+    events=[];top=COMMENT_TOP.get(layout,COMMENT_TOP['band'])+shift;width=WIDTH-2*COMMENT_MARGIN;left=COMMENT_MARGIN
     for index,card in enumerate(cards):
         start=min(card['at'],duration);end=cards[index+1]['at'] if index+1<len(cards) else duration+1
         if end<=start:continue
@@ -400,8 +408,9 @@ def comment_events(cards,layout,duration):
     return events
 
 
-def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layout='band'):
+def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layout='band',offsets=None):
     """Build the ASS subtitle file (headline + narration captions) and the matching SRT text."""
+    shift={k:px((offsets or {}).get(k) or 0) for k in OFFSETS}
     lines,size=title_lines(doc['headline'])
     title=r'\N'.join(('{\\c'+ass_color(style['title' if i==0 else 'title2'])+'}')+ass_text(line) for i,line in enumerate(lines))
     title_family,title_bold=ass_font(title_font or FONT);caption_family,caption_bold=ass_font(caption_font or FONT);ui_family,ui_bold=ass_font(FONT)
@@ -415,15 +424,15 @@ def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layo
          f'Style: CommentName,{ui_family},{COMMENT_NAME_FONT},&H00707070&,&H000000FF&,&H00000000&,&H00000000&,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
          f'Style: Comment,{ui_family},{COMMENT_FONT},&H00141414&,&H000000FF&,&H00000000&,&H00000000&,{ui_bold},0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
          '','[Events]','Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
-         f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{title_bottom})}}{title}']
-    if credit:ass.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Credit,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT-px(12)})}}{ass_text(credit)}')
-    ass.extend(comment_events(doc.get('comments') or [],layout,duration))
+         f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{title_bottom+shift["title_y"]})}}{title}']
+    if credit:ass.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Credit,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT-px(12)+shift["credit_y"]})}}{ass_text(credit)}')
+    ass.extend(comment_events(doc.get('comments') or [],layout,duration,shift['comment_y']))
     srt=[];chunks=caption_chunks(doc['script'])
     for index,chunk in enumerate(chunks):
         start=duration*index/len(chunks);end=duration*(index+1)/len(chunks)
         srt.extend([str(index+1),f'{srt_time(start)} --> {srt_time(end)}','\n'.join(' '.join(w for w,_ in line) for line in chunk),''])
         text=r'\N'.join(' '.join(('{\\c'+ass_color(style['highlight'])+'}'+ass_text(w)+'{\\c'+ass_color(style['caption'])+'}') if marked else ass_text(w) for w,marked in line) for line in chunk)
-        if captions:ass.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{{\\pos({WIDTH//2},{CAPTION_BOTTOM.get(layout,CAPTION_BOTTOM["band"])})}}{text}')
+        if captions:ass.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{{\\pos({WIDTH//2},{CAPTION_BOTTOM.get(layout,CAPTION_BOTTOM["band"])+shift["caption_y"]})}}{text}')
     return '\n'.join(ass)+'\n','\n'.join(srt)
 
 
@@ -449,7 +458,7 @@ def render(p):
         title_font=font_path(cfg.get('title_font',''));caption_font=font_path(cfg.get('caption_font',''))
         fonts=run/'fonts';fonts.mkdir()
         for path in {title_font,caption_font,Path(FONT)}:shutil.copyfile(path,fonts/path.name)
-        ass,srt=subtitles(doc,style,duration,cfg['captions'],title_font,caption_font,cfg.get('layout','fill'))
+        ass,srt=subtitles(doc,style,duration,cfg['captions'],title_font,caption_font,cfg.get('layout','fill'),cfg)
         (run/'overlay.ass').write_text(ass,encoding='utf-8')
         vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"ass=filename={filter_path(run/'overlay.ass')}:fontsdir={filter_path(fonts)}"])
         (run/'captions.srt').write_text(srt,encoding='utf-8')

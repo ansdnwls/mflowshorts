@@ -24,3 +24,10 @@
 .comment-clear{font-size:12px;padding:4px 10px;white-space:nowrap}
 .credit-field{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}
 .credit-toggle{white-space:nowrap;padding-bottom:10px}
+.offset-panel{border:1px solid var(--line);border-radius:9px;padding:10px 14px;display:grid;gap:6px;margin:10px 0}
+.offset-panel legend{font-size:12px;padding:0 4px}
+.offset-row{display:grid;grid-template-columns:72px 1fr 44px;align-items:center;gap:10px;font-size:12px}
+.offset-row input{width:100%}
+.offset-row output{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
+.offset-actions{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.offset-actions button{font-size:12px;padding:4px 10px;white-space:nowrap}

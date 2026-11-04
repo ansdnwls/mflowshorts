@@ -99,6 +99,23 @@ class ProductionTests(unittest.TestCase):
         production.update_project({'id':self.ident,'credit':'출처. 채널','credit_on':False})
         doc=production.project(self.ident)['document']
         self.assertEqual((doc['credit'],doc['credit_on']),('출처. 채널',False))  # text kept for switching back on
+    def test_position_offsets(self):
+        doc={'headline':'제목','script':'대본','credit':'출처','comments':[{'name':'a','when':'','text':'댓글','at':0}]}
+        with patch.object(production,'font_info',return_value=('Test Font',700)):
+            base,_=production.subtitles(doc,production.STYLES['basic'],10,True)
+            moved,_=production.subtitles(doc,production.STYLES['basic'],10,True,offsets={'title_y':10,'credit_y':-10,'caption_y':-100,'comment_y':20})
+        px=production.px
+        def y(ass,style):
+            import re
+            return int(re.search(r','+style+r',,0,0,0,,\{\\(?:an7\\)?pos\(\d+,(\d+)\)',ass).group(1))
+        self.assertEqual(y(moved,'Title')-y(base,'Title'),px(10))
+        self.assertEqual(y(moved,'Credit')-y(base,'Credit'),px(-10))
+        self.assertEqual(y(moved,'Caption')-y(base,'Caption'),px(-100))
+        self.assertEqual(y(moved,'Card')-y(base,'Card'),px(20))
+        cfg=production.settings({'title_y':'15','comment_y':-40.4})
+        self.assertEqual((cfg['title_y'],cfg['comment_y'],cfg['caption_y']),(15,-40,0))
+        for bad in (301,-301,'x',float('nan')):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):production.settings({'caption_y':bad})
     def test_rendering_project_cannot_be_edited(self):
         p=production.project(self.ident);p['status']='rendering';production.store(p)
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'script':'edit'})
