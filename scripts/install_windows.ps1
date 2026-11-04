@@ -6,7 +6,7 @@
 #   scripts\install_windows.cmd -CheckOnly   (아무것도 설치하지 않고 상태만 확인)
 #
 # 확인 항목: Python 3.12+, Git, FFmpeg·ffprobe, 맑은 고딕 Bold, 미디어 가상환경(yt-dlp·Playwright),
-# douyin-downloader 고정 커밋, Playwright Chromium, 한글 제목 실제 렌더링.
+# douyin-downloader 고정 커밋, Playwright Chromium, 한글 제목·자막 실제 렌더링(앱과 같은 ASS/libass 경로).
 # 없는 프로그램은 winget으로 현재 사용자 범위에 설치합니다. 기존 data/ 내용은 지우지 않습니다.
 [CmdletBinding()]
 param(
@@ -212,26 +212,34 @@ with sync_playwright() as p:
 }
 
 # 6. 실제 렌더링 확인 -----------------------------------------------------
-Write-Step '한글 제목 렌더링 시험 (앱과 같은 글꼴·FFmpeg 필터 사용)'
+Write-Step '한글 제목 렌더링 시험 (앱과 같은 ASS 자막·글꼴 사용)'
 if ($Python -and $ffmpeg) {
     $renderTest = @'
-import os, pathlib, subprocess, sys, tempfile
+import pathlib, shutil, subprocess, sys, tempfile
 sys.path.insert(0, sys.argv[1])
 import production
-print('font=' + production.FONT)
-if not pathlib.Path(production.FONT).is_file(): sys.exit('글꼴 파일이 없습니다: ' + production.FONT)
+# 앱의 render()와 같은 방식: ASS 자막 파일 + libass(fontsdir)로 한글 제목·자막을 그립니다.
+font = pathlib.Path(production.FONT)
+print('font=' + str(font))
+if not font.is_file(): sys.exit('기본 글꼴 파일이 없습니다: ' + str(font))
+print('fonts_folder=%d' % len(production.available_fonts()))
 with tempfile.TemporaryDirectory() as d:
-    work = pathlib.Path(d)
-    title = work / 'title.txt'; title.write_text('한글 제목 테스트 123', encoding='utf-8')
+    work = pathlib.Path(d); fonts = work / 'fonts'; fonts.mkdir()
+    shutil.copyfile(font, fonts / font.name)
+    doc = {'headline': '한글 제목 테스트 123', 'script': '자막 확인 문장입니다.'}
+    style = production.STYLES[next(iter(production.STYLES))]
+    ass, _ = production.subtitles(doc, style, 1, True)
+    (work / 'overlay.ass').write_text(ass, encoding='utf-8')
     out = work / 'check.mp4'
-    vf = f"drawtext=fontfile={production.filter_path(production.FONT)}:textfile={production.filter_path(title)}:expansion=none:fontcolor=yellow:fontsize=38:x=(w-text_w)/2:y=65"
-    subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=720x1280:d=1', '-vf', vf, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(out)], check=True, timeout=60)
+    size = '%dx%d' % (production.WIDTH, production.HEIGHT)
+    vf = 'ass=filename=%s:fontsdir=%s' % (production.filter_path(work / 'overlay.ass'), production.filter_path(fonts))
+    subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=' + size + ':d=1', '-vf', vf, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(out)], check=True, timeout=60)
     probe = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', str(out)], capture_output=True, text=True, check=True, timeout=20)
     print('render=' + probe.stdout.strip())
 '@
     $renderOut = @(Invoke-PythonCode $Python.Path @() $renderTest @($ProjectRoot))
     if ($LASTEXITCODE -eq 0) { Add-Result '렌더링 시험' 'OK' (($renderOut | ForEach-Object { "$_".Trim() }) -join ', ') }
-    else { Add-Result '렌더링 시험' '실패' '한글 제목 렌더링에 실패했습니다. 위 오류를 확인하세요.' }
+    else { Add-Result '렌더링 시험' '실패' '한글 제목 렌더링에 실패했습니다. FFmpeg에 libass(ass 필터)가 있는지와 위 오류를 확인하세요.' }
 }
 else { Add-Result '렌더링 시험' '건너뜀' 'Python 또는 FFmpeg가 없어 실행하지 않았습니다.' }
 
