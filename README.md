@@ -4,7 +4,7 @@
 
 ## 실행
 
-Python 3.12 이상. 기본 YouTube 앱은 표준 라이브러리로 실행합니다. Douyin·TikTok 연동은 아래 미디어 도구 설치 절차가 필요합니다.
+Python 3.11 이상 (미디어 도구 고정 버전이 3.11 이상 필요). 기본 YouTube 앱은 표준 라이브러리로 실행합니다. Douyin·TikTok 연동은 아래 미디어 도구 설치 절차가 필요합니다.
 
 ```bash
 cd /workspace/mflowshorts
@@ -22,7 +22,7 @@ set PORT=8010
 python app.py
 ```
 
-스크립트는 Python 3.12+, Git, FFmpeg·ffprobe, 맑은 고딕 Bold(`C:\Windows\Fonts\malgunbd.ttf`), 미디어 가상환경(`data\media-venv`, `requirements-media.lock` 고정 버전), douyin-downloader 고정 커밋, Playwright Chromium을 확인합니다. 없는 프로그램은 winget으로 설치하고, 마지막에 앱과 같은 글꼴·FFmpeg 필터로 한글 제목 영상을 실제로 만들어 봅니다. 기존 `data\` 내용은 지우거나 덮어쓰지 않습니다. `-SkipMedia`를 붙이면 Douyin·TikTok 도구 설치를 건너뜁니다. 새로 설치한 프로그램이 있으면 새 터미널 창에서 앱을 실행하세요. Windows의 TikTok 검색은 `CHROMIUM_PATH`가 없으면 Playwright가 내려받은 Chromium을 사용합니다.
+스크립트는 Python 3.11+ (없으면 3.12 설치), Git, FFmpeg·ffprobe, 맑은 고딕 Bold(`C:\Windows\Fonts\malgunbd.ttf`), 미디어 가상환경(`data\media-venv`, `requirements-media.lock` 고정 버전), douyin-downloader 고정 커밋, Playwright Chromium을 확인합니다. 없는 프로그램은 winget으로 설치하고, 마지막에 앱과 같은 ASS 자막·글꼴로 한글 제목 영상을 실제로 만들어 봅니다. 기존 `data\` 내용은 지우거나 덮어쓰지 않습니다. `-SkipMedia`를 붙이면 Douyin·TikTok 도구 설치를 건너뜁니다. 새로 설치한 프로그램이 있으면 새 터미널 창에서 앱을 실행하세요. Windows의 TikTok 검색은 `CHROMIUM_PATH`가 없으면 Playwright가 내려받은 Chromium을 사용합니다.
 
 #### AI 자막 지우기 (NVIDIA 그래픽카드, 선택)
 
