@@ -5,7 +5,7 @@
 #   scripts\install_windows.cmd              (같은 동작, cmd에서 실행)
 #   scripts\install_windows.cmd -CheckOnly   (아무것도 설치하지 않고 상태만 확인)
 #
-# 확인 항목: Python 3.12+, Git, FFmpeg·ffprobe, 맑은 고딕 Bold, 미디어 가상환경(yt-dlp·Playwright),
+# 확인 항목: Python 3.11+ (requirements-media.lock의 multidict 7.2.1이 3.11 이상 필요), Git, FFmpeg·ffprobe, 맑은 고딕 Bold, 미디어 가상환경(yt-dlp·Playwright),
 # douyin-downloader 고정 커밋, Playwright Chromium, 한글 제목·자막 실제 렌더링(앱과 같은 ASS/libass 경로).
 # 없는 프로그램은 winget으로 현재 사용자 범위에 설치합니다. 기존 data/ 내용은 지우지 않습니다.
 [CmdletBinding()]
@@ -80,7 +80,7 @@ function Find-Python {
         try { $out = @(Invoke-PythonCode $exe $prefix $probe @() 2>$null) } catch { continue }
         if ($LASTEXITCODE -ne 0 -or $out.Count -lt 2) { continue }
         $parts = $out[0].Trim().Split('.')
-        if ([int]$parts[0] -gt 3 -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -ge 12)) {
+        if ([int]$parts[0] -gt 3 -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -ge 11)) {
             return [pscustomobject]@{ Version = $out[0].Trim(); Path = $out[1].Trim() }
         }
     }
@@ -98,11 +98,11 @@ if ($CheckOnly) { Write-Host '확인 전용 모드: 아무것도 설치하거나
 Update-SessionPath
 
 # 1. Python ---------------------------------------------------------------
-Write-Step 'Python 3.12 이상'
+Write-Step 'Python 3.11 이상'
 $Python = Find-Python
 if (-not $Python -and (Install-WithWinget 'Python.Python.3.12' 'Python 3.12')) { $Python = Find-Python }
 if ($Python) { Add-Result 'Python' 'OK' "$($Python.Version) ($($Python.Path))" }
-else { Add-Result 'Python' '실패' 'Python 3.12 이상을 찾지 못했습니다. python.org 설치 시 "Add python.exe to PATH"를 선택하세요.' }
+else { Add-Result 'Python' '실패' 'Python 3.11 이상을 찾지 못했습니다. python.org 설치 시 "Add python.exe to PATH"를 선택하세요.' }
 
 # 2. Git (douyin-downloader 내려받기용) -------------------------------------
 Write-Step 'Git'
