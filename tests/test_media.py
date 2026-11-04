@@ -50,3 +50,13 @@ class MediaTests(unittest.TestCase):
         directory=app.MEDIA_ROOT/'job';directory.mkdir(parents=True);(directory/'video.part').write_bytes(b'partial')
         with patch('subprocess.run',side_effect=subprocess.TimeoutExpired('worker',240)):app.run_media_job('job',{'platform':'TikTok','action':'download'})
         self.assertFalse(directory.exists());self.assertEqual(app.state()['media_jobs'][0]['status'],'error')
+    def test_unexpected_error_does_not_leave_job_running(self):
+        self.insert_job()
+        output={'ok':True,'result':{'videos':[{'platform':'TikTok','external_id':'1','url':'https://www.tiktok.com/@a/video/1'}]}}
+        with patch('subprocess.run',return_value=subprocess.CompletedProcess([],0,stdout=json.dumps(output))),patch.object(app,'save_external_video',side_effect=RuntimeError('db')),patch('traceback.print_exc'):
+            app.run_media_job('job',{'platform':'TikTok','action':'inspect'})
+        self.assertEqual(app.state()['media_jobs'][0]['status'],'error')
+    def test_non_object_worker_output_is_an_error(self):
+        self.insert_job()
+        with patch('subprocess.run',return_value=subprocess.CompletedProcess([],0,stdout='null')):app.run_media_job('job',{'platform':'TikTok','action':'inspect'})
+        self.assertEqual(app.state()['media_jobs'][0]['status'],'error')

@@ -116,6 +116,10 @@ python3 app.py
 
 필수 시스템 도구: `ffmpeg`, `ffprobe`, `/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc`. 현재 클라우드에는 이미 설치되어 있으며 실제 렌더링으로 검증했습니다.
 
+글꼴은 Linux Noto CJK, Windows 맑은 고딕 Bold(`C:/Windows/Fonts/malgunbd.ttf`), macOS Apple SD 고딕 순서로 찾습니다. 다른 글꼴은 `MFLOW_FONT`에 경로를 지정하세요. 맑은 고딕은 중국어 간체 일부 글자를 표시하지 못할 수 있습니다. 업로드 원본은 MP4/MOV/WebM 계열 형식만 받으며 재생목록(HLS 등) 파일은 거부합니다.
+
+서버는 `Host`가 `127.0.0.1`·`localhost`인 요청만 처리합니다. 다른 주소로 접속하면 403이 반환됩니다.
+
 ```bash
 python3 -m unittest discover -s tests -v
 node --check web/app.js

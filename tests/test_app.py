@@ -1,5 +1,9 @@
 import datetime as dt
+import http.client
+import json
+import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -68,5 +72,37 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(result['videos'],[])
         self.assertEqual(result['all_videos'][0]['id'],'old')
         self.assertEqual(result['research']['old']['saved'],1)
+
+class ServerTests(unittest.TestCase):
+    setUp_db = DiscoveryTests.setUp
+    def setUp(self):
+        self.setUp_db()
+        self.server=app.ThreadingHTTPServer(('127.0.0.1',0),app.Handler)
+        threading.Thread(target=self.server.serve_forever,daemon=True).start()
+    def tearDown(self):
+        self.server.shutdown();self.server.server_close();DiscoveryTests.tearDown(self)
+    def request(self,method,path,body=None,host=None):
+        con=http.client.HTTPConnection('127.0.0.1',self.server.server_address[1],timeout=5)
+        headers={'Content-Type':'application/json'}
+        if host:headers['Host']=host
+        con.request(method,path,body=json.dumps(body) if body is not None else None,headers=headers)
+        response=con.getresponse();data=response.read();con.close()
+        return response.status,data
+    def test_foreign_host_header_is_rejected(self):
+        self.assertEqual(self.request('GET','/api/state',host='attacker.example:8000')[0],403)
+        self.assertEqual(self.request('POST','/api/scan',{},host='attacker.example')[0],403)
+        self.assertEqual(self.request('GET','/api/state',host='localhost:8000')[0],200)
+    def test_unexpected_error_returns_json_500(self):
+        with patch.object(app,'state',side_effect=RuntimeError('boom')),patch('traceback.print_exc'):
+            status,data=self.request('GET','/api/state')
+        self.assertEqual(status,500);self.assertIn('error',json.loads(data))
+    def test_settings_missing_or_non_numeric_fields_get_clear_message(self):
+        status,data=self.request('POST','/api/settings',{'queries':'cats'})
+        self.assertEqual(status,400);self.assertIn('모두 입력',json.loads(data)['error'])
+        status,data=self.request('POST','/api/settings',{'queries':'cats','days':'abc','min_views':'0','hour_kst':'9','schedule':'false'})
+        self.assertEqual(status,400);self.assertIn('숫자',json.loads(data)['error'])
+    def test_connections_are_closed_after_use(self):
+        with app.connect() as con: con.execute('SELECT 1')
+        with self.assertRaises(sqlite3.ProgrammingError): con.execute('SELECT 1')
 
 if __name__ == "__main__": unittest.main()
