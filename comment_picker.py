@@ -84,7 +84,8 @@ def from_youtube(items, now=None):
         candidates.append({'text': text, 'name': mask(snippet.get('authorDisplayName')), 'when': time_ago(snippet.get('publishedAt'), now),
                            'likes': likes, 'replies': int((item.get('snippet') or {}).get('totalReplyCount') or 0),
                            'korean': korean, 'fits': len(text) <= CARD_LIMIT, 'score': score(text, likes)})
-    candidates.sort(key=lambda c: c['score'], reverse=True)
+    # Most liked first; the curiosity score only breaks ties.
+    candidates.sort(key=lambda c: (c['likes'], c['score']), reverse=True)
     korean = sum(c['korean'] for c in candidates)
     # "Went viral in Korea": enough Korean voices among the top comments to use them as they are.
     viral_kr = korean >= 5 or (candidates and korean / len(candidates) >= 0.3)
