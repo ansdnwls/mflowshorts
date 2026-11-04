@@ -10,6 +10,7 @@ import uuid
 import shutil
 import mimetypes
 import production
+import comment_picker
 import os
 import sqlite3
 import threading
@@ -75,6 +76,13 @@ def youtube(endpoint, params):
     try:
         with urllib.request.urlopen(req, timeout=25) as response:
             return json.load(response)
+    except urllib.error.HTTPError as exc:
+        try: reasons = {e.get('reason') for e in json.load(exc).get('error',{}).get('errors',[])}
+        except Exception: reasons = set()
+        if 'commentsDisabled' in reasons: raise ValueError('이 영상은 댓글이 꺼져 있어요. 댓글 카드는 직접 입력하세요.') from None
+        if reasons & {'quotaExceeded','dailyLimitExceeded'}: raise ValueError('오늘 YouTube API 사용량을 다 썼어요. 내일(한국 시각 오후 4~5시 이후) 다시 시도하세요.') from None
+        if 'videoNotFound' in reasons: raise ValueError('YouTube 영상을 찾을 수 없어요. 비공개·삭제 여부와 원본 링크를 확인하세요.') from None
+        raise ValueError('YouTube API 요청에 실패했습니다. API 키, 할당량, 네트워크 허용 설정을 확인하세요.') from None
     except (urllib.error.URLError, TimeoutError):
         raise ValueError('YouTube API 요청에 실패했습니다. API 키, 할당량, 네트워크 허용 설정을 확인하세요.') from None
 
@@ -277,6 +285,24 @@ def analyze_channel(channel_id):
         con.execute('INSERT OR REPLACE INTO channels VALUES (?,?,?,?,?)',(channel_id,statistics.median(values),len(values),subscribers,now.isoformat()))
     return f'최근 공개 업로드 {len(values)}개의 조회수 중앙값을 계산했습니다.'
 
+def source_comments(project_id):
+    """Public top comments of a project's YouTube source, ranked for comment cards. Nothing is stored."""
+    doc = production.project(project_id)['document']
+    video_id = comment_picker.youtube_id(doc.get('source_url'))
+    if not video_id: raise ValueError('원본 링크가 YouTube 영상일 때 댓글을 자동으로 불러올 수 있어요. TikTok·더우인 댓글은 직접 입력하세요.')
+    if not os.environ.get('YOUTUBE_API_KEY'): raise ValueError('댓글을 불러오려면 YOUTUBE_API_KEY가 필요해요. 서버를 켜기 전에 set YOUTUBE_API_KEY=키 를 입력하세요.')
+    items, token = [], None
+    for _ in range(2):  # 2 pages = 2 quota units, about 200 top comments
+        params = {'part':'snippet','videoId':video_id,'maxResults':100,'order':'relevance','textFormat':'plainText'}
+        if token: params['pageToken'] = token
+        page = youtube('commentThreads', params)
+        items += page.get('items',[])
+        token = page.get('nextPageToken')
+        if not token: break
+    result = comment_picker.from_youtube(items)
+    if not result['comments']: raise ValueError('카드로 쓸 만한 공개 댓글을 찾지 못했어요. 댓글 카드는 직접 입력하세요.')
+    return result
+
 def scheduler():
     # Opt-in daily scan, persisted across process restarts.
     while True:
@@ -396,6 +422,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/production/projects':return self.send_json({'id':production.create_project(data)})
             if self.path == '/api/production/update':
                 production.update_project(data);return self.send_json({'message':'프로젝트를 저장했습니다. 설정 변경으로 이전 승인은 해제됩니다.'})
+            if self.path == '/api/production/comments': return self.send_json(source_comments(str(data.get('id',''))))
             if self.path == '/api/production/approve':
                 production.approve(str(data.get('id','')));return self.send_json({'message':'현재 대본과 스타일을 승인했습니다.'})
             if self.path == '/api/production/render':

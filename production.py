@@ -56,7 +56,19 @@ def state():
         projects=[]
         for row in con.execute('SELECT * FROM production_projects ORDER BY updated_at DESC'):
             p=dict(row);p['document']=json.loads(p['document']);projects.append(p)
+        for p in projects:p['comment_info']=comment_info(con,p['document'])
     return {'channels':channels,'projects':projects,'styles':STYLES,'fonts':available_fonts(),'render_available':bool(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(FONT).is_file())}
+
+
+def comment_info(con,doc):
+    """Whether the source has public comments to turn into cards ("댓글 작업 가능")."""
+    from comment_picker import youtube_id
+    count=None
+    if doc.get('source_video_id'):
+        try:row=con.execute('SELECT comments FROM videos WHERE id=?',(doc['source_video_id'],)).fetchone()
+        except Exception:row=None  # discovery tables are created by app.py
+        count=row[0] if row else None
+    return {'count':count,'auto':bool(youtube_id(doc.get('source_url'))),'available':bool(count) or (count is None and bool(youtube_id(doc.get('source_url'))))}
 
 
 def project(project_id):
