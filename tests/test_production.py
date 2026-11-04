@@ -1,7 +1,9 @@
 import io
+import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 import unittest
@@ -206,6 +208,57 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(p['status'],'completed',p['document']['message'])
         info=production.probe(production.PROJECT_ROOT/self.ident/p['document']['output'])
         self.assertEqual((info['width'],info['height'],info['audio']),(1080,1920,True))
+    AI_STUB=("import argparse,json,os,subprocess,sys\n"
+             "a=argparse.ArgumentParser();a.add_argument('-i');a.add_argument('-o');a.add_argument('-c',action='append',nargs=4,type=int);a.add_argument('--inpaint-mode')\n"
+             "args=a.parse_args();assert os.path.isfile('backend/main.py')\n"
+             "open(os.environ['STUB_LOG'],'a').write(json.dumps(sys.argv[1:])+'\\n')\n"
+             "if os.environ.get('STUB_NO_TEXT'):print('No subtitles detected. Check file: x');sys.exit(1)\n"
+             "draw=','.join('drawbox=x=%d:y=%d:w=%d:h=%d:color=gray:t=fill'%(c[2],c[0],c[3]-c[2],c[1]-c[0]) for c in args.c)\n"
+             "subprocess.run(['ffmpeg','-loglevel','error','-y','-i',args.i,'-vf',draw]+(['-frames:v','1'] if args.o.endswith('.png') else ['-pix_fmt','yuv420p'])+[args.o],check=True)\n")
+    def ai_stub(self):
+        """A stand-in for video-subtitle-remover's command line, unpacked like data/vsr/<package>/backend/main.py."""
+        root=Path(self.temp.name)/'vsr';(root/'pkg/backend').mkdir(parents=True);(root/'pkg/backend/main.py').write_text(self.AI_STUB,encoding='utf-8')
+        return patch.object(production,'AI_ROOT',root),patch.dict(os.environ,{'MFLOW_VSR_PYTHON':sys.executable,'STUB_LOG':str(Path(self.temp.name)/'stub_args.json')}),patch.dict(production._TOOL_CACHE,clear=True)
+    def test_ai_mode_needs_tool(self):
+        self.assertEqual(production.blurs([{'x':0.1,'y':0.6,'w':0.8,'h':0.05,'mode':'ai'}])[0]['mode'],'ai')
+        with patch.object(production,'AI_ROOT',Path(self.temp.name)/'none'),patch.dict(production._TOOL_CACHE,clear=True):
+            self.assertIsNone(production.ai_eraser());self.assertFalse(production.state()['ai_ready'])
+            with self.assertRaisesRegex(ValueError,'install_ai_eraser'):production.erase_ai('a.mp4','b.mp4',[])
+    @unittest.skipUnless(shutil.which('ffmpeg') and Path(production.FONT).is_file(),'needs ffmpeg and a Korean font')
+    def test_ai_mode_renders(self):
+        source=Path(self.temp.name)/'src.mp4'
+        subprocess.run(['ffmpeg','-loglevel','error','-f','lavfi','-i','testsrc=size=540x960:rate=30','-f','lavfi','-i','sine','-t','2','-pix_fmt','yuv420p','-shortest',str(source)],check=True)
+        with source.open('rb') as f:production.upload(self.ident,f,source.stat().st_size)
+        cfg={**production.default_settings(),'duration':2,'layout':'fit'}
+        production.update_project({'id':self.ident,'script':'대본','settings':cfg,'blurs':[{'x':0.1,'y':0.55,'w':0.8,'h':0.1,'mode':'ai','start':0.5,'end':1.5},{'x':0.1,'y':0.3,'w':0.3,'h':0.05,'mode':'blur'}]})
+        production.approve(self.ident)
+        root,env,cache=self.ai_stub()
+        with root,env,cache:
+            self.assertTrue(production.state()['ai_ready'])
+            png=production.preview_frame(self.ident,'1');self.assertTrue(png.startswith(b'\x89PNG'))
+            self.assertTrue(production.preview_frame(self.ident,'1.8').startswith(b'\x89PNG'))  # box not active: tool not called
+            p=production.project(self.ident);production.LOCK.acquire();production.render(p)
+        p=production.project(self.ident)
+        self.assertEqual(p['status'],'completed',p['document']['message'])
+        run=(production.PROJECT_ROOT/self.ident/p['document']['output']).parent
+        info=production.probe(run/'short.mp4')
+        self.assertEqual((info['width'],info['height'],info['audio']),(1080,1920,True))
+        self.assertEqual(production.probe(run/'laid.mp4')['width'],1080)
+        calls=[json.loads(line) for line in (Path(self.temp.name)/'stub_args.json').read_text().splitlines()]
+        self.assertEqual(len(calls),2)  # preview at 1s and the render; not the preview at 1.8s
+        self.assertTrue(calls[0][calls[0].index('-i')+1].endswith('.png'));call=calls[1]
+        self.assertTrue(call[call.index('-i')+1].startswith(str(Path(self.temp.name)/'vsr')))  # staged inside the tool folder
+        self.assertEqual([x.name for x in (Path(self.temp.name)/'vsr').iterdir()],['pkg'])  # staging cleaned up
+        self.assertEqual(call[call.index('-c')+1:],['1056','1248','108','972'])
+        self.assertEqual(call[call.index('--inpaint-mode')+1],'sttn-det')
+    @unittest.skipUnless(shutil.which('ffmpeg'),'needs ffmpeg')
+    def test_ai_mode_without_text_keeps_video(self):
+        source=Path(self.temp.name)/'in.mp4';output=Path(self.temp.name)/'out.mp4'
+        subprocess.run(['ffmpeg','-loglevel','error','-f','lavfi','-i','testsrc=size=108x192:rate=10','-t','1','-pix_fmt','yuv420p',str(source)],check=True)
+        root,env,cache=self.ai_stub()
+        with root,env,cache,patch.dict(os.environ,{'STUB_NO_TEXT':'1'}):
+            production.erase_ai(source,output,[{'x':0,'y':0,'w':1,'h':0.1}])
+        self.assertEqual(output.read_bytes(),source.read_bytes())
     def test_unexpected_render_error_is_recoverable(self):
         self.add_source();production.update_project({'id':self.ident,'script':'대본'});production.approve(self.ident)
         with patch.object(production,'state',return_value={'render_available':True}),patch.object(production.threading,'Thread') as thread:

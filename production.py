@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import textwrap
 import threading
 import uuid
@@ -23,6 +24,14 @@ FONT = os.environ.get('MFLOW_FONT') or next((f for f in FONT_CANDIDATES if Path(
 # The OpenCV text eraser runs in the media venv, like the platform tools.
 MEDIA_PYTHON = Path(os.environ.get('MFLOW_MEDIA_PYTHON',Path(__file__).parent/('data/media-venv/Scripts/python.exe' if os.name=='nt' else 'data/media-venv/bin/python')))
 _TOOL_CACHE = {}
+# video-subtitle-remover (AI, NVIDIA) unpacked by scripts\install_ai_eraser.cmd. Its OCR cannot load models from
+# folders with Korean names on Windows, so the installer may put it elsewhere and write the place to data/vsr-path.txt.
+def _ai_root():
+    if os.environ.get('MFLOW_VSR_DIR'):return Path(os.environ['MFLOW_VSR_DIR'])
+    pointer=Path(__file__).parent/'data/vsr-path.txt'
+    try:return Path(pointer.read_text(encoding='utf-8-sig').strip()) if pointer.is_file() else Path(__file__).parent/'data/vsr'
+    except OSError:return Path(__file__).parent/'data/vsr'
+AI_ROOT = _ai_root()
 FONTS_DIR = Path(os.environ.get('MFLOW_FONTS_DIR',Path(__file__).parent/'fonts'))
 FONT_SUFFIXES = ('.ttf','.otf','.ttc')
 _FONT_CACHE = {}
@@ -60,7 +69,7 @@ def state():
         for row in con.execute('SELECT * FROM production_projects ORDER BY updated_at DESC'):
             p=dict(row);p['document']=json.loads(p['document']);projects.append(p)
         for p in projects:p['comment_info']=comment_info(con,p['document'])
-    return {'channels':channels,'projects':projects,'styles':STYLES,'fonts':available_fonts(),'letters_ready':letters_ready(),'gpu':gpu_info(),'render_available':bool(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(FONT).is_file())}
+    return {'channels':channels,'projects':projects,'styles':STYLES,'fonts':available_fonts(),'letters_ready':letters_ready(),'ai_ready':ai_eraser() is not None,'gpu':gpu_info(),'render_available':bool(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(FONT).is_file())}
 
 
 def comment_info(con,doc):
@@ -297,7 +306,8 @@ def blurs(value):
     return result
 
 
-BLUR_MODES=('erase','blur','text')
+BLUR_MODES=('erase','blur','text','ai')
+PRE_MODES=('text','ai')  # handled outside FFmpeg, before the blur graph
 FEATHER=px(11)  # soft edge so the box outline does not show
 
 
@@ -322,6 +332,10 @@ def blur_graph(chain,boxes,duration):
         on=f"between(t,{box['start']},{box['end'] or duration+1})"
         graph.append(f"[v{i}]split[m{i}][s{i}];[s{i}]crop={cw}:{ch}:{cx}:{cy},split[k{i}][q{i}];[q{i}]{mask}[a{i}];[k{i}]{hide}[h{i}];[h{i}][a{i}]alphamerge[f{i}];[m{i}][f{i}]overlay={cx}:{cy}:enable='{on}'[v{i+1}]")
     return ';'.join(graph)+f';[v{len(boxes)}]null'
+
+
+class ToolError(ValueError):
+    """A text-removal step failed; its message is shown to the user as is."""
 
 
 def letters_ready():
@@ -356,11 +370,69 @@ def gpu_info():
 
 def erase_letters(task):
     """Run text_eraser.py in the media venv. Returns its stdout (PNG bytes in frame mode)."""
-    if not letters_ready():raise ValueError('글자만 지우기(정밀)를 쓰려면 scripts\\install_windows.cmd 를 한 번 다시 실행해 OpenCV를 설치하세요.')
+    if not letters_ready():raise ToolError('글자만 지우기(정밀)를 쓰려면 scripts\\install_windows.cmd 를 한 번 다시 실행해 OpenCV를 설치하세요.')
     task={'width':WIDTH,'height':HEIGHT,'formats':SOURCE_FORMATS,**task}
     result=subprocess.run([str(MEDIA_PYTHON),str(Path(__file__).parent/'text_eraser.py')],input=json.dumps(task).encode('utf-8'),capture_output=True,timeout=900)
-    if result.returncode:raise ValueError('글자만 지우기 처리에 실패했어요. 원본 영상과 박스 위치를 확인하세요.')
+    if result.returncode:raise ToolError('글자만 지우기 처리에 실패했어요. 원본 영상과 박스 위치를 확인하세요.')
     return result.stdout
+
+
+def ai_eraser():
+    """(python, folder) of video-subtitle-remover under data/vsr, or None. Cached for a minute."""
+    import time
+    cached=_TOOL_CACHE.get('ai')
+    if cached and time.time()-cached[0]<60:return cached[1]
+    found=None
+    if AI_ROOT.is_dir():
+        for main in [m for pattern in ('backend/main.py','*/backend/main.py','*/*/backend/main.py') for m in AI_ROOT.glob(pattern)]:
+            root=main.parent.parent
+            if os.environ.get('MFLOW_VSR_PYTHON'):candidates=[Path(os.environ['MFLOW_VSR_PYTHON'])]
+            else:candidates=[root/name for name in ('python/python.exe','python.exe','runtime/python.exe','.venv/Scripts/python.exe','venv/Scripts/python.exe','.venv/bin/python','venv/bin/python')]+sorted(root.glob('*/python.exe'))+sorted(AI_ROOT.glob('python.exe'))+sorted(AI_ROOT.glob('*/python.exe'))
+            python=next((c for c in candidates if c.is_file()),None)
+            if python:found=(python,root);break
+    _TOOL_CACHE['ai']=(time.time(),found);return found
+
+
+def erase_ai(source,output,boxes,log=None):
+    """Remove subtitles inside the boxes with video-subtitle-remover.
+
+    Video: STTN with OCR detection (sttn-det), so only frames that really show text are repainted.
+    Picture (preview): the tool always uses OCR + LaMa. Box times are not passed: detection finds when text is shown.
+    """
+    tool=ai_eraser()
+    if not tool:raise ToolError('AI 자막 지우기를 쓰려면 scripts\\install_ai_eraser.cmd 를 먼저 실행하세요.')
+    python,root=tool;source,output=Path(source),Path(output)
+    # Work on copies inside the tool's own (ASCII) folder: its video reader fails on Korean paths on Windows.
+    work=Path(tempfile.mkdtemp(dir=AI_ROOT));staged_in,staged_out=work/('in'+source.suffix),work/('out'+output.suffix)
+    try:
+        shutil.copyfile(source,staged_in)
+        _run_ai(python,root,staged_in,staged_out,boxes,log)
+        shutil.move(str(staged_out),str(output))
+    finally:shutil.rmtree(work,ignore_errors=True)
+
+
+def _run_ai(python,root,source,output,boxes,log):
+    command=[str(python),'backend/main.py','-i',str(source),'-o',str(output),'--inpaint-mode','sttn-det']
+    for box in boxes:
+        x,y=round(box['x']*WIDTH),round(box['y']*HEIGHT);w,h=round(box['w']*WIDTH),round(box['h']*HEIGHT)
+        command+=['-c',str(max(y,0)),str(min(y+h,HEIGHT)),str(max(x,0)),str(min(x+w,WIDTH))]
+    env={**os.environ,'PYTHONUTF8':'1','PYTHONIOENCODING':'utf-8','QT_QPA_PLATFORM':'offscreen','PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK':'True'}
+    try:result=subprocess.run(command,cwd=root,capture_output=True,env=env,timeout=3600)
+    except subprocess.TimeoutExpired:raise ToolError('AI 자막 지우기가 1시간 안에 끝나지 않았어요.') from None
+    text=(result.stdout+result.stderr).decode('utf-8','replace')
+    if log:Path(log).write_text(text,encoding='utf-8')
+    if output.is_file() and output.stat().st_size:return
+    if 'No subtitles detected' in text:shutil.copyfile(source,output);return  # nothing to remove in the boxes
+    raise ToolError('AI 자막 지우기에 실패했어요. 그래픽카드 드라이버와 박스 위치를 확인하세요.'+(f' (기록: {log})' if log else ''))
+
+
+def layout_frame(source,seek,vf,output):
+    """One laid-out 1080×1920 PNG frame, before any box is applied."""
+    command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-ss',str(seek),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source),'-frames:v','1','-vf',','.join(vf) or 'null',str(output)]
+    if subprocess.run(command,capture_output=True,timeout=60).returncode or not Path(output).is_file():raise ValueError('미리보기 화면을 만들지 못했어요. 원본 영상과 시작 시간을 확인하세요.')
+
+
+IMAGE_FORMATS='image2,png_pipe'
 
 
 def preview_frame(project_id,at):
@@ -376,15 +448,26 @@ def preview_frame(project_id,at):
     # -ss before -i resets t to 0, so shift the box times by the same amount.
     boxes=[{**b,'start':b['start']-at,'end':(b['end']-at) if b['end'] else 0} for b in doc.get('blurs') or [] if not b['end'] or b['end']>at]
     boxes=[{**b,'start':max(b['start'],0),'end':max(b['end'],0.01) if b['end'] else 0} for b in boxes]
+    active=lambda b:b['start']<=at and (not b['end'] or at<b['end'])
     letters=[b for b in doc.get('blurs') or [] if b.get('mode')=='text']
-    boxes=[b for b in boxes if b.get('mode')!='text']
-    if letters:
-        png=erase_letters({'mode':'frame','source':str(PROJECT_ROOT/project_id/doc['source']['filename']),'start':cfg['start'],'at':at,'chain':blur_graph(','.join(vf),boxes,1),'boxes':letters})
-        if not png.startswith(b'\x89PNG'):raise ValueError('미리보기 화면을 만들지 못했어요.')
-        return png
-    graph=blur_graph(','.join(vf),boxes,1)+',scale=540:-2'
-    command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-ss',str(cfg['start']+at),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(PROJECT_ROOT/project_id/doc['source']['filename']),'-frames:v','1','-vf',graph,'-f','image2pipe','-c:v','png','-']
-    result=subprocess.run(command,capture_output=True,timeout=60)
+    ai=[b for b in doc.get('blurs') or [] if b.get('mode')=='ai' and active(b)]
+    boxes=[b for b in boxes if b.get('mode') not in PRE_MODES]
+    source,start,formats=PROJECT_ROOT/project_id/doc['source']['filename'],cfg['start'],SOURCE_FORMATS
+    with tempfile.TemporaryDirectory() as tmp:
+        if ai:
+            # The AI tool works on the laid-out frame; the steps below then start from its result.
+            laid,source=Path(tmp)/'frame.png',Path(tmp)/'clean.png'
+            layout_frame(PROJECT_ROOT/project_id/doc['source']['filename'],cfg['start']+at,vf,laid)
+            erase_ai(laid,source,ai)
+            vf,start,at,formats=[],0,0,IMAGE_FORMATS
+            letters=[{**b,'start':0,'end':0} for b in letters if active(b)]
+        if letters:
+            png=erase_letters({'mode':'frame','source':str(source),'start':start,'at':at,'chain':blur_graph(','.join(vf) or 'null',boxes,1),'boxes':letters,'formats':formats})
+            if not png.startswith(b'\x89PNG'):raise ValueError('미리보기 화면을 만들지 못했어요.')
+            return png
+        graph=blur_graph(','.join(vf) or 'null',boxes,1)+',scale=540:-2'
+        command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-ss',str(start+at),'-format_whitelist',formats,'-protocol_whitelist','file','-i',str(source),'-frames:v','1','-vf',graph,'-f','image2pipe','-c:v','png','-']
+        result=subprocess.run(command,capture_output=True,timeout=60)
     if result.returncode or not result.stdout:raise ValueError('미리보기 화면을 만들지 못했어요. 원본 영상과 시작 시간을 확인하세요.')
     return result.stdout
 
@@ -629,14 +712,22 @@ def render(p):
         style=STYLES[cfg['style']]
         vf=layout_filters(cfg.get('layout','fill'))
         if cfg['mirror']:vf.append('hflip')
-        boxes=doc.get('blurs') or [];letters=[b for b in boxes if b.get('mode')=='text']
+        boxes=doc.get('blurs') or [];letters=[b for b in boxes if b.get('mode')=='text'];ai=[b for b in boxes if b.get('mode')=='ai']
         source_args=['-ss',str(cfg['start']),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source)]
-        if letters:
-            # Letters-only erase works frame by frame in OpenCV on the laid-out video; the result replaces the source picture.
-            cleaned=run/'cleaned.mp4'
-            erase_letters({'mode':'video','source':str(source),'start':cfg['start'],'duration':duration,'chain':','.join(vf),'boxes':letters,'output':str(cleaned)})
-            vf=[];source_args=['-i',str(cleaned)]+source_args
-        vf=[blur_graph(','.join(vf) or 'null',[b for b in boxes if b.get('mode')!='text'],duration)]
+        if ai or letters:
+            # These erasers work on the laid-out video outside FFmpeg; their result replaces the source picture.
+            picture=None
+            if ai:
+                laid=run/'laid.mp4'
+                subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y',*source_args,'-t',str(duration),'-map','0:v:0','-an','-vf',','.join(vf+['fps=30']) ,'-c:v','libx264','-preset','veryfast','-crf','14','-pix_fmt','yuv420p',str(laid)],capture_output=True,timeout=900,check=True)
+                picture=run/'ai.mp4';erase_ai(laid,picture,ai,run/'ai_eraser.log')
+            if letters:
+                cleaned=run/'cleaned.mp4'
+                if picture:erase_letters({'mode':'video','source':str(picture),'start':0,'duration':duration,'chain':'null','boxes':letters,'output':str(cleaned)})
+                else:erase_letters({'mode':'video','source':str(source),'start':cfg['start'],'duration':duration,'chain':','.join(vf),'boxes':letters,'output':str(cleaned)})
+                picture=cleaned
+            vf=[];source_args=['-i',str(picture)]+source_args
+        vf=[blur_graph(','.join(vf) or 'null',[b for b in boxes if b.get('mode') not in PRE_MODES],duration)]
         # libass loads the font from its own folder, so it does not depend on the system font setup (fontconfig on Windows).
         title_font=font_path(cfg.get('title_font',''));caption_font=font_path(cfg.get('caption_font',''))
         fonts=run/'fonts';fonts.mkdir()
@@ -646,7 +737,7 @@ def render(p):
         vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"ass=filename={filter_path(run/'overlay.ass')}:fontsdir={filter_path(fonts)}"])
         (run/'captions.srt').write_text(srt,encoding='utf-8')
         output=run/'short.mp4'
-        audio=1 if letters else 0
+        audio=1 if letters or ai else 0
         command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args,'-t',str(duration),'-map','0:v:0']
         if not cfg['mute']:command+=['-map',f'{audio}:a:0?']
         command+=['-vf',','.join(vf),'-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
@@ -663,7 +754,7 @@ def render(p):
     except Exception as exc:
         if not isinstance(exc,(ValueError,OSError,subprocess.SubprocessError)):traceback.print_exc()
         shutil.rmtree(run,ignore_errors=True)
-        p['status']='error';doc['message']='렌더링에 실패했습니다. 원본 형식과 시작 시간·길이를 확인하고 다시 시도하세요.'
+        p['status']='error';doc['message']=str(exc) if isinstance(exc,ToolError) else '렌더링에 실패했습니다. 원본 형식과 시작 시간·길이를 확인하고 다시 시도하세요.'
         try:store(p)
         except Exception:traceback.print_exc()
     finally:LOCK.release()

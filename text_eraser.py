@@ -57,9 +57,10 @@ def clean(frame, boxes, t, cv2, np):
 
 
 def decode(task, extra):
+    # A single frame needs no fps filter (after an overlay on a still picture it would output nothing).
     return ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-ss', str(task['start']),
             '-format_whitelist', task['formats'], '-protocol_whitelist', 'file', '-i', task['source'],
-            *extra, '-vf', task['chain'] + f',fps={FPS},format=bgr24', '-f', 'rawvideo', '-']
+            *extra, '-vf', task['chain'] + (',format=bgr24' if task['mode'] == 'frame' else f',fps={FPS},format=bgr24'), '-f', 'rawvideo', '-']
 
 
 def run(task):
