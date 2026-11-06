@@ -1,6 +1,8 @@
 """Integration checks for persisted review, approval, and narration boundaries."""
 import io
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -160,6 +162,79 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             workflow.save_analysis(self.ident, {'scenes': [{'id': 'x', 'start': 3, 'end': 1}]})
         self.assertEqual(original, self.document())
+
+    def real_source(self, seconds=6):
+        source = Path(self.temp.name) / 'src.mp4'
+        subprocess.run(['ffmpeg', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=size=540x960:rate=30',
+                        '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', str(seconds), '-pix_fmt', 'yuv420p',
+                        '-shortest', str(source)], check=True)
+        with source.open('rb') as file:
+            production.upload(self.ident, file, source.stat().st_size)
+
+    def two_scene_voice(self, blurs=None):
+        workflow.analyze(self.ident)
+        analysis = self.document()['analysis']
+        analysis['scenes'] = [
+            {'id': 'scene-1', 'start': 0, 'end': 1, 'description': '첫 장면', 'dialogue': '',
+             'subtitle_clues': [], 'id_clues': [], 'facts': ['고양이가 앉아 있다'], 'inferences': []},
+            {'id': 'scene-2', 'start': 3, 'end': 6, 'description': '둘째 장면', 'dialogue': '',
+             'subtitle_clues': [], 'id_clues': [], 'facts': ['고양이가 일어선다'], 'inferences': ['배가 고팠을 수 있다']}]
+        workflow.save_analysis(self.ident, analysis)
+        workflow.confirm_analysis(self.ident)
+        workflow.generate_script(self.ident)
+        doc = self.document()
+        production.update_project({'id': self.ident, 'script': doc['script'], 'headline': '고양이',
+                                   'settings': {**doc['settings'], 'layout': 'fit'}, 'blurs': blurs or []})
+        production.approve(self.ident)
+        workflow.generate_narration(self.ident, narration.MockTTS())
+
+    def render_now(self):
+        p = production.project(self.ident)
+        production.LOCK.acquire()
+        production.render(p)
+        p = production.project(self.ident)
+        self.assertEqual(p['status'], 'completed', p['document']['message'])
+        return p['document'], (production.PROJECT_ROOT / self.ident / p['document']['output']).parent
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and Path(production.FONT).is_file(), 'needs ffmpeg and a Korean font')
+    def test_voice_render_follows_narration_and_ducks_original(self):
+        self.real_source()
+        self.two_scene_voice(blurs=[{'x': 0.1, 'y': 0.3, 'w': 0.3, 'h': 0.05, 'mode': 'blur'}])
+        doc, run = self.render_now()
+        voice = doc['narration']
+        info = production.probe(run / 'short.mp4')
+        self.assertEqual((info['width'], info['height'], info['audio']), (1080, 1920, True))
+        self.assertAlmostEqual(info['duration'], voice['duration'], delta=0.15)
+        report = doc['qa_report']
+        self.assertEqual(report['audio_scope'], 'rendered_mix')
+        self.assertNotIn('audio_duration_mismatch', [item['code'] for item in report['issues']], report)
+        self.assertTrue(report['passed'], report)
+        manifest = json.loads((run / 'project.json').read_text(encoding='utf-8'))
+        self.assertEqual(manifest['version'], 2)
+        self.assertEqual([cut['scene_id'] for cut in manifest['edit_plan']], ['scene-1', 'scene-2', 'scene-2'])
+        srt = (run / 'captions.srt').read_text(encoding='utf-8')
+        last = voice['segments'][-1]
+        self.assertIn(production.srt_time(last['end']), srt)
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and Path(production.FONT).is_file(), 'needs ffmpeg and a Korean font')
+    def test_voice_render_with_text_eraser_reads_source_from_zero(self):
+        self.real_source()
+        self.two_scene_voice(blurs=[{'x': 0.1, 'y': 0.6, 'w': 0.8, 'h': 0.05, 'mode': 'text'}])
+        tasks = []
+
+        def fake_eraser(task):
+            # Stand-in for the OpenCV eraser: lay out the window it was asked for.
+            tasks.append(task)
+            subprocess.run(['ffmpeg', '-loglevel', 'error', '-y', '-ss', str(task['start']), '-i', task['source'],
+                            '-t', str(task['duration']), '-an', '-vf', task['chain'], '-pix_fmt', 'yuv420p',
+                            task['output']], check=True)
+        with patch.object(production, 'erase_letters', fake_eraser):
+            doc, run = self.render_now()
+        self.assertEqual(tasks[0]['start'], 0)
+        self.assertAlmostEqual(tasks[0]['duration'], 6, delta=0.01)
+        info = production.probe(run / 'short.mp4')
+        self.assertEqual((info['width'], info['height'], info['audio']), (1080, 1920, True))
+        self.assertTrue(doc['qa_report']['passed'], doc['qa_report'])
 
 
 if __name__ == '__main__':

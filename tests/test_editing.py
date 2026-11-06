@@ -24,7 +24,7 @@ class PlanTests(unittest.TestCase):
     def test_matches_exact_source_scene_and_holds_short_clip(self):
         analysis, script, audio = fixture()
         cuts = editing.build_plan(analysis, script, audio, 15)
-        self.assertEqual([(c['source_start'], c['source_end']) for c in cuts], [(2, 3), (7, 10), (7, 8)])
+        self.assertEqual([(c['source_start'], c['source_end']) for c in cuts], [(2, 3), (7, 10), (10, 11)])
         self.assertEqual([(c['start'], c['end']) for c in cuts], [(0, 2), (2, 5), (5, 6)])
         self.assertEqual(cuts[0]['duration'], 2)
         self.assertEqual(cuts[0]['scene_id'], 's1')

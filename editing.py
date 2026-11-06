@@ -57,6 +57,8 @@ def _segments(script, narration):
 def build_plan(analysis, script, narration, source_duration):
     """Map each measured sentence to its reviewed scene, freezing short scenes.
 
+    Later sentences on the same scene pick up where the previous one ended.
+
     Source media is never stretched/slowed; a short scene holds its last frame
     while its original audio is padded with silence to the sentence boundary.
     """
@@ -65,13 +67,18 @@ def build_plan(analysis, script, narration, source_duration):
     analysis_script.validate_script(script, analysis)
     segments = _segments(script, narration)
     scenes = {scene['id']: scene for scene in analysis['scenes']}
-    result = []
+    result, cursor = [], {}
     for segment in segments:
         scene = scenes.get(segment['scene_id'])
         if scene is None:
             raise ValueError('나레이션에 연결된 분석 장면이 없습니다.')
-        source_start = float(scene['start'])
+        # A scene used by several sentences continues where the last cut stopped,
+        # so the viewer does not see the same seconds again; it restarts once used up.
+        source_start = cursor.get(scene['id'], float(scene['start']))
+        if float(scene['end']) - source_start < 0.5:
+            source_start = float(scene['start'])
         source_end = min(float(scene['end']), source_start + segment['duration'])
+        cursor[scene['id']] = source_end
         result.append({key: segment[key] for key in ('sentence_id', 'scene_id', 'start', 'end', 'duration')} |
                       {'source_start': source_start, 'source_end': source_end})
     return result

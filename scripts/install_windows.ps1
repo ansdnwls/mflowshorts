@@ -258,5 +258,5 @@ if ($failed.Count -gt 0) {
 }
 if ($warned.Count -gt 0) { Write-Host "경고 $($warned.Count)개가 있습니다." -ForegroundColor Yellow }
 else { Write-Host '모두 준비됐습니다.' -ForegroundColor Green }
-Write-Host '새로 설치한 프로그램이 있으면 새 cmd 창을 연 뒤 실행하세요:  set PORT=8010  그다음  python app.py'
+Write-Host '새로 설치한 프로그램이 있으면 새 cmd 창을 연 뒤 실행하세요:  python app.py  (주소: http://127.0.0.1:8020)'
 exit 0
