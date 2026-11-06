@@ -26,6 +26,10 @@ class PickerTests(unittest.TestCase):
     def test_most_liked_first(self):
         result = comment_picker.from_youtube([thread('왜 그런 거지?', 5), thread('just a normal comment', 900), thread('진짜 웃기다 ㅋㅋ', 50)], NOW)
         self.assertEqual([c['likes'] for c in result['comments']], [900, 50, 5])
+    def test_credit_line(self):
+        self.assertEqual(production.credit_line('  Jennifer   Hudson Show '), '출처. Jennifer Hudson Show')
+        self.assertEqual(production.credit_line(''), '')
+        self.assertEqual(len(production.credit_line('x' * 100)), 60)
     def test_labels(self):
         self.assertEqual(comment_picker.time_ago('2026-11-04T00:00:00Z', NOW), '12시간 전')
         self.assertEqual(comment_picker.time_ago('2026-10-31T12:00:00Z', NOW), '4일 전')
@@ -67,11 +71,18 @@ class SourceCommentTests(unittest.TestCase):
         calls = []
         def api(endpoint, params):
             calls.append((endpoint, dict(params)))
+            if endpoint == 'videos': return {'items': [{'snippet': {'channelTitle': 'Jennifer Hudson Show'}}]}
             if 'pageToken' in params: return {'items': [thread('두번째 페이지 댓글 ㅋㅋ', 3)]}
             return {'items': [thread('첫 페이지 댓글 진짜?', 10)], 'nextPageToken': 'next'}
         with patch.dict('os.environ', {'YOUTUBE_API_KEY': 'test'}), patch.object(app, 'youtube', side_effect=api):
             result = app.source_comments(self.ident)
-        self.assertEqual([c[0] for c in calls], ['commentThreads', 'commentThreads'])
+        self.assertEqual([c[0] for c in calls], ['commentThreads', 'commentThreads', 'videos'])
+        self.assertEqual(result['credit'], '출처. Jennifer Hudson Show')
+        production.update_project({'id': self.ident, 'credit': '내 출처'})
+        calls.clear()
+        with patch.dict('os.environ', {'YOUTUBE_API_KEY': 'test'}), patch.object(app, 'youtube', side_effect=api):
+            self.assertNotIn('credit', app.source_comments(self.ident))
+        self.assertNotIn('videos', [c[0] for c in calls])  # no extra quota once a credit is set
         self.assertEqual(calls[0][1]['videoId'], 'dQw4w9WgXcQ'); self.assertEqual(calls[0][1]['order'], 'relevance')
         self.assertEqual(result['total'], 2); self.assertEqual(result['korean'], 2)
         self.assertEqual(production.project(self.ident)['document']['comments'], [])  # nothing stored until picked
@@ -87,6 +98,7 @@ class SourceCommentTests(unittest.TestCase):
         ident = production.create_project({'title': '발굴 영상', 'channel_id': channel, 'source_video_id': 'dQw4w9WgXcQ'})
         info = next(p for p in production.state()['projects'] if p['id'] == ident)['comment_info']
         self.assertEqual(info, {'count': 42, 'auto': True, 'available': True})
+        self.assertEqual(production.project(ident)['document']['credit'], '출처. c')
         plain = next(p for p in production.state()['projects'] if p['id'] == self.ident)['comment_info']
         self.assertFalse(plain['available'])
 

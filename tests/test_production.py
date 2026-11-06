@@ -1,4 +1,9 @@
 import io
+import json
+import os
+import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 import unittest
@@ -88,6 +93,83 @@ class ProductionTests(unittest.TestCase):
         doc={'source':{'filename':'a.mp4'},'script':'s','headline':'h','settings':production.default_settings()}
         self.assertEqual(production.fingerprint(doc),production.fingerprint({**doc,'credit':'','comments':[]}))
         self.assertNotEqual(production.fingerprint(doc),production.fingerprint({**doc,'credit':'출처'}))
+    def test_credit_can_be_switched_off(self):
+        doc={'headline':'제목','script':'대본','credit':'출처. 채널','credit_on':False}
+        with patch.object(production,'font_info',return_value=('Test Font',700)):
+            ass,_=production.subtitles(doc,production.STYLES['basic'],10,True)
+        self.assertNotIn(',Credit,,',ass)
+        base={'source':{'filename':'a.mp4'},'script':'s','headline':'h','settings':production.default_settings(),'credit':'출처'}
+        self.assertEqual(production.fingerprint(base),production.fingerprint({**base,'credit_on':True}))
+        self.assertNotEqual(production.fingerprint(base),production.fingerprint({**base,'credit_on':False}))
+        production.update_project({'id':self.ident,'credit':'출처. 채널','credit_on':False})
+        doc=production.project(self.ident)['document']
+        self.assertEqual((doc['credit'],doc['credit_on']),('출처. 채널',False))  # text kept for switching back on
+    def test_position_offsets(self):
+        doc={'headline':'제목','script':'대본','credit':'출처','comments':[{'name':'a','when':'','text':'댓글','at':0}]}
+        with patch.object(production,'font_info',return_value=('Test Font',700)):
+            base,_=production.subtitles(doc,production.STYLES['basic'],10,True)
+            moved,_=production.subtitles(doc,production.STYLES['basic'],10,True,offsets={'title_y':10,'credit_y':-10,'caption_y':-100,'comment_y':20})
+        px=production.px
+        def y(ass,style):
+            import re
+            return int(re.search(r','+style+r',,0,0,0,,\{\\(?:an7\\)?pos\(\d+,(\d+)\)',ass).group(1))
+        self.assertEqual(y(moved,'Title')-y(base,'Title'),px(10))
+        self.assertEqual(y(moved,'Credit')-y(base,'Credit'),px(-10))
+        self.assertEqual(y(moved,'Caption')-y(base,'Caption'),px(-100))
+        self.assertEqual(y(moved,'Card')-y(base,'Card'),px(20))
+        cfg=production.settings({'title_y':'15','comment_y':-40.4})
+        self.assertEqual((cfg['title_y'],cfg['comment_y'],cfg['caption_y']),(15,-40,0))
+        for bad in (301,-301,'x',float('nan')):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):production.settings({'caption_y':bad})
+    def test_blur_boxes(self):
+        boxes=production.blurs([{'x':0.05,'y':0.6,'w':2,'h':0.1},{'x':0.5,'y':0.5,'w':0.001,'h':0.001},{'x':0,'y':0,'w':0.5,'h':0.1,'start':1,'end':3,'mode':'blur'}])
+        self.assertEqual([b['mode'] for b in boxes],['erase','blur'])
+        self.assertEqual(len(boxes),2)  # the tiny one is dropped
+        self.assertAlmostEqual(boxes[0]['w'],0.95)  # clamped to the frame
+        for bad in ('x',[{'x':'a'}],[{'x':0,'y':0,'w':0.5,'h':0.5,'start':3,'end':2}],[{'x':0,'y':0,'w':0.5,'h':0.5}]*7,[{'x':0,'y':0,'w':0.5,'h':0.5,'mode':'pixelate'}]):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):production.blurs(bad)
+        graph=production.blur_graph('scale=1080:1920',boxes,5)
+        self.assertEqual(graph.count('delogo='),1);self.assertEqual(graph.count('boxblur='),1);self.assertEqual(graph.count('alphamerge'),2)
+        self.assertIn("enable='between(t,1.0,3.0)'",graph);self.assertIn("enable='between(t,0.0,6)'",graph)
+        self.assertTrue(graph.endswith('[v2]null'))
+        self.assertEqual(production.blur_graph('scale=1080:1920',[],5),'scale=1080:1920')
+        base={'source':{'filename':'a.mp4'},'script':'s','headline':'h','settings':production.default_settings()}
+        self.assertEqual(production.fingerprint(base),production.fingerprint({**base,'blurs':[]}))
+        self.assertNotEqual(production.fingerprint(base),production.fingerprint({**base,'blurs':boxes}))
+        production.update_project({'id':self.ident,'blurs':boxes})
+        self.assertEqual(production.project(self.ident)['document']['blurs'],boxes)
+    @unittest.skipUnless(shutil.which('ffmpeg'),'needs ffmpeg')
+    def test_blur_graph_runs_in_ffmpeg(self):
+        boxes=production.blurs([{'x':0.05,'y':0.6,'w':0.9,'h':0.1},{'x':0.1,'y':0.3,'w':0.3,'h':0.05,'start':0.2,'end':0.6,'mode':'blur'},{'x':0,'y':0,'w':1,'h':0.02},{'x':0.9,'y':0.97,'w':0.1,'h':0.03,'mode':'blur'}])  # edge boxes too
+        graph=production.blur_graph(','.join(production.layout_filters('band')),boxes,1)+',drawbox=x=0:y=0:w=iw:h=10:color=black:t=fill'
+        result=subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=size=640x360:rate=10','-t','1','-vf',graph,'-f','null','-'],capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+    @unittest.skipUnless(shutil.which('ffmpeg'),'needs ffmpeg')
+    def test_preview_frame_png(self):
+        source=Path(self.temp.name)/'src.mp4'
+        subprocess.run(['ffmpeg','-loglevel','error','-f','lavfi','-i','testsrc=size=320x568:rate=10','-t','2','-pix_fmt','yuv420p',str(source)],check=True)
+        with source.open('rb') as f:production.upload(self.ident,f,source.stat().st_size)
+        production.update_project({'id':self.ident,'blurs':[{'x':0.1,'y':0.6,'w':0.8,'h':0.05}]})
+        png=production.preview_frame(self.ident,'1')
+        self.assertTrue(png.startswith(b'\x89PNG'))
+        self.assertTrue(production.preview_frame(self.ident,'nan').startswith(b'\x89PNG'))
+    def test_caption_timeline(self):
+        items=production.cues([{'text':'둘째','start':3,'pos':'middle','look':'box','y':10},{'text':' 첫 *줄* ','sub':'first line','start':0,'pos':'top','look':'accent'},{'text':'','start':5}])
+        self.assertEqual([c['text'] for c in items],['첫 *줄*','둘째'])
+        for bad in ([{'text':'a','start':70}],[{'text':'a','start':3,'end':2}],[{'text':'a','pos':'left'}],[{'text':'a','look':'neon'}],[{'text':'가'*61}],'x'):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):production.cues(bad)
+        doc={'headline':'제목','script':'이 대본은 쓰이지 않아요','cues':items}
+        with patch.object(production,'font_info',return_value=('Test Font',700)):
+            ass,srt=production.subtitles(doc,production.STYLES['basic'],10,True)
+            hidden,_=production.subtitles(doc,production.STYLES['basic'],10,False)
+        self.assertIn('0:00:00.00,0:00:03.00,CaptionAccent,,0,0,0,,{\\an8\\pos(540,510)}',ass)
+        self.assertIn(f'0:00:03.00,0:00:11.00,CaptionBox,,0,0,0,,{{\\an5\\pos(540,{975+production.px(10)})}}둘째',ass)
+        self.assertIn('first line',ass);self.assertNotIn('쓰이지',ass)
+        self.assertIn('첫 줄\nfirst line',srt);self.assertIn('00:00:03,000 --> 00:00:10,000',srt)
+        self.assertNotIn('CaptionBox,,',hidden)
+        base={'source':{'filename':'a.mp4'},'script':'s','headline':'h','settings':production.default_settings()}
+        self.assertEqual(production.fingerprint(base),production.fingerprint({**base,'cues':[]}))
+        self.assertNotEqual(production.fingerprint(base),production.fingerprint({**base,'cues':items}))
     def test_rendering_project_cannot_be_edited(self):
         p=production.project(self.ident);p['status']='rendering';production.store(p)
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'script':'edit'})
@@ -106,6 +188,77 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(doc['script'],'')
         self.assertIsNone(doc['approved_hash'])
 
+    def test_letters_mode_needs_opencv(self):
+        self.assertEqual(production.blurs([{'x':0.1,'y':0.6,'w':0.8,'h':0.05,'mode':'text'}])[0]['mode'],'text')
+        with patch.object(production,'letters_ready',return_value=False),self.assertRaisesRegex(ValueError,'install_windows'):
+            production.erase_letters({'mode':'frame'})
+        self.assertIn('letters_ready',production.state());self.assertIn('names',production.state()['gpu'])
+    @unittest.skipUnless(shutil.which('ffmpeg') and os.environ.get('MFLOW_TEST_CV_PYTHON'),'needs ffmpeg and a Python with OpenCV (MFLOW_TEST_CV_PYTHON)')
+    def test_letters_mode_renders(self):
+        source=Path(self.temp.name)/'src.mp4'
+        subprocess.run(['ffmpeg','-loglevel','error','-f','lavfi','-i','testsrc=size=540x960:rate=30','-f','lavfi','-i','sine','-t','2','-vf',"drawbox=x=100:y=600:w=340:h=40:color=white:t=fill",'-pix_fmt','yuv420p','-shortest',str(source)],check=True)
+        with source.open('rb') as f:production.upload(self.ident,f,source.stat().st_size)
+        cfg={**production.default_settings(),'duration':2,'layout':'fit'}
+        production.update_project({'id':self.ident,'script':'대본','settings':cfg,'blurs':[{'x':0.1,'y':0.55,'w':0.8,'h':0.1,'mode':'text'},{'x':0.1,'y':0.3,'w':0.3,'h':0.05,'mode':'blur'}]})
+        production.approve(self.ident)
+        with patch.object(production,'MEDIA_PYTHON',Path(os.environ['MFLOW_TEST_CV_PYTHON'])),patch.dict(production._TOOL_CACHE,clear=True):
+            self.assertTrue(production.preview_frame(self.ident,'1').startswith(b'\x89PNG'))
+            p=production.project(self.ident);production.LOCK.acquire();production.render(p)
+        p=production.project(self.ident)
+        self.assertEqual(p['status'],'completed',p['document']['message'])
+        info=production.probe(production.PROJECT_ROOT/self.ident/p['document']['output'])
+        self.assertEqual((info['width'],info['height'],info['audio']),(1080,1920,True))
+    AI_STUB=("import argparse,json,os,subprocess,sys\n"
+             "a=argparse.ArgumentParser();a.add_argument('-i');a.add_argument('-o');a.add_argument('-c',action='append',nargs=4,type=int);a.add_argument('--inpaint-mode')\n"
+             "args=a.parse_args();assert os.path.isfile('backend/main.py')\n"
+             "open(os.environ['STUB_LOG'],'a').write(json.dumps(sys.argv[1:])+'\\n')\n"
+             "if os.environ.get('STUB_NO_TEXT'):print('No subtitles detected. Check file: x');sys.exit(1)\n"
+             "draw=','.join('drawbox=x=%d:y=%d:w=%d:h=%d:color=gray:t=fill'%(c[2],c[0],c[3]-c[2],c[1]-c[0]) for c in args.c)\n"
+             "subprocess.run(['ffmpeg','-loglevel','error','-y','-i',args.i,'-vf',draw]+(['-frames:v','1'] if args.o.endswith('.png') else ['-pix_fmt','yuv420p'])+[args.o],check=True)\n")
+    def ai_stub(self):
+        """A stand-in for video-subtitle-remover's command line, unpacked like data/vsr/<package>/backend/main.py."""
+        root=Path(self.temp.name)/'vsr';(root/'pkg/backend').mkdir(parents=True);(root/'pkg/backend/main.py').write_text(self.AI_STUB,encoding='utf-8')
+        return patch.object(production,'AI_ROOT',root),patch.dict(os.environ,{'MFLOW_VSR_PYTHON':sys.executable,'STUB_LOG':str(Path(self.temp.name)/'stub_args.json')}),patch.dict(production._TOOL_CACHE,clear=True)
+    def test_ai_mode_needs_tool(self):
+        self.assertEqual(production.blurs([{'x':0.1,'y':0.6,'w':0.8,'h':0.05,'mode':'ai'}])[0]['mode'],'ai')
+        with patch.object(production,'AI_ROOT',Path(self.temp.name)/'none'),patch.dict(production._TOOL_CACHE,clear=True):
+            self.assertIsNone(production.ai_eraser());self.assertFalse(production.state()['ai_ready'])
+            with self.assertRaisesRegex(ValueError,'install_ai_eraser'):production.erase_ai('a.mp4','b.mp4',[])
+    @unittest.skipUnless(shutil.which('ffmpeg') and Path(production.FONT).is_file(),'needs ffmpeg and a Korean font')
+    def test_ai_mode_renders(self):
+        source=Path(self.temp.name)/'src.mp4'
+        subprocess.run(['ffmpeg','-loglevel','error','-f','lavfi','-i','testsrc=size=540x960:rate=30','-f','lavfi','-i','sine','-t','2','-pix_fmt','yuv420p','-shortest',str(source)],check=True)
+        with source.open('rb') as f:production.upload(self.ident,f,source.stat().st_size)
+        cfg={**production.default_settings(),'duration':2,'layout':'fit'}
+        production.update_project({'id':self.ident,'script':'대본','settings':cfg,'blurs':[{'x':0.1,'y':0.55,'w':0.8,'h':0.1,'mode':'ai','start':0.5,'end':1.5},{'x':0.1,'y':0.3,'w':0.3,'h':0.05,'mode':'blur'}]})
+        production.approve(self.ident)
+        root,env,cache=self.ai_stub()
+        with root,env,cache:
+            self.assertTrue(production.state()['ai_ready'])
+            png=production.preview_frame(self.ident,'1');self.assertTrue(png.startswith(b'\x89PNG'))
+            self.assertTrue(production.preview_frame(self.ident,'1.8').startswith(b'\x89PNG'))  # box not active: tool not called
+            p=production.project(self.ident);production.LOCK.acquire();production.render(p)
+        p=production.project(self.ident)
+        self.assertEqual(p['status'],'completed',p['document']['message'])
+        run=(production.PROJECT_ROOT/self.ident/p['document']['output']).parent
+        info=production.probe(run/'short.mp4')
+        self.assertEqual((info['width'],info['height'],info['audio']),(1080,1920,True))
+        self.assertEqual(production.probe(run/'laid.mp4')['width'],1080)
+        calls=[json.loads(line) for line in (Path(self.temp.name)/'stub_args.json').read_text().splitlines()]
+        self.assertEqual(len(calls),2)  # preview at 1s and the render; not the preview at 1.8s
+        self.assertTrue(calls[0][calls[0].index('-i')+1].endswith('.png'));call=calls[1]
+        self.assertTrue(call[call.index('-i')+1].startswith(str(Path(self.temp.name)/'vsr')))  # staged inside the tool folder
+        self.assertEqual([x.name for x in (Path(self.temp.name)/'vsr').iterdir()],['pkg'])  # staging cleaned up
+        self.assertEqual(call[call.index('-c')+1:],['1056','1248','108','972'])
+        self.assertEqual(call[call.index('--inpaint-mode')+1],'sttn-det')
+    @unittest.skipUnless(shutil.which('ffmpeg'),'needs ffmpeg')
+    def test_ai_mode_without_text_keeps_video(self):
+        source=Path(self.temp.name)/'in.mp4';output=Path(self.temp.name)/'out.mp4'
+        subprocess.run(['ffmpeg','-loglevel','error','-f','lavfi','-i','testsrc=size=108x192:rate=10','-t','1','-pix_fmt','yuv420p',str(source)],check=True)
+        root,env,cache=self.ai_stub()
+        with root,env,cache,patch.dict(os.environ,{'STUB_NO_TEXT':'1'}):
+            production.erase_ai(source,output,[{'x':0,'y':0,'w':1,'h':0.1}])
+        self.assertEqual(output.read_bytes(),source.read_bytes())
     def test_unexpected_render_error_is_recoverable(self):
         self.add_source();production.update_project({'id':self.ident,'script':'대본'});production.approve(self.ident)
         with patch.object(production,'state',return_value={'render_available':True}),patch.object(production.threading,'Thread') as thread:

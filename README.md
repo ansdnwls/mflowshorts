@@ -24,6 +24,15 @@ python app.py
 
 스크립트는 Python 3.12+, Git, FFmpeg·ffprobe, 맑은 고딕 Bold(`C:\Windows\Fonts\malgunbd.ttf`), 미디어 가상환경(`data\media-venv`, `requirements-media.lock` 고정 버전), douyin-downloader 고정 커밋, Playwright Chromium을 확인합니다. 없는 프로그램은 winget으로 설치하고, 마지막에 앱과 같은 글꼴·FFmpeg 필터로 한글 제목 영상을 실제로 만들어 봅니다. 기존 `data\` 내용은 지우거나 덮어쓰지 않습니다. `-SkipMedia`를 붙이면 Douyin·TikTok 도구 설치를 건너뜁니다. 새로 설치한 프로그램이 있으면 새 터미널 창에서 앱을 실행하세요. Windows의 TikTok 검색은 `CHROMIUM_PATH`가 없으면 Playwright가 내려받은 Chromium을 사용합니다.
 
+#### AI 자막 지우기 (NVIDIA 그래픽카드, 선택)
+
+```bat
+scripts\install_ai_eraser.cmd -CheckOnly   :: 그래픽카드와 설치 상태만 확인
+scripts\install_ai_eraser.cmd              :: 그래픽카드에 맞는 패키지를 내려받아 설치
+```
+
+원본 글자 가리기의 "AI 자막 지우기 (NVIDIA)" 모드는 [video-subtitle-remover](https://github.com/YaoFANGUK/video-subtitle-remover)(Apache-2.0)의 Windows 실행 패키지를 씁니다. 스크립트는 `nvidia-smi`로 그래픽카드 세대와 드라이버 버전을 읽어 CUDA 11.8 / 12.6 / 12.8 패키지 중 하나를 고릅니다. 패키지에는 Python·PyTorch·PaddleOCR이 들어 있어 용량이 수 GB이고, PC의 Python은 건드리지 않습니다. 이 도구의 문자 인식은 한글 경로의 모델 파일을 읽지 못하기 때문에, 프로젝트 경로에 한글이 있으면 `%LOCALAPPDATA%\mflowshorts\vsr`에 설치합니다. 설치 위치는 `data\vsr-path.txt`에 적힙니다. 자동으로 받을 수 없으면 릴리스 페이지에서 직접 받은 뒤 `-Archive 파일경로`로 설치하세요. 렌더할 때는 박스 안에서 자막이 보이는 프레임만 찾아(OCR) STTN으로 다시 그립니다. 처리 기록은 렌더 폴더의 `ai_eraser.log`에 남습니다.
+
 로컬 포트 기본값은 8000이며 `PORT`로 변경할 수 있습니다. 서버는 기본적으로 루프백에만 바인딩합니다. 사용자 인증이 없는 개인 개발용입니다.
 
 ## 가능한 작업

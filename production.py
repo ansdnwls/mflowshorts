@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import textwrap
 import threading
 import uuid
@@ -20,6 +21,17 @@ FONT_CANDIDATES = ['/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc','C:/Win
 FONT = os.environ.get('MFLOW_FONT') or next((f for f in FONT_CANDIDATES if Path(f).is_file()),FONT_CANDIDATES[0])
 # Extra fonts the user drops in this folder (.ttf/.otf/.ttc) can be picked per project for the title and captions.
 # The folder is not in git because many free fonts do not allow redistribution.
+# The OpenCV text eraser runs in the media venv, like the platform tools.
+MEDIA_PYTHON = Path(os.environ.get('MFLOW_MEDIA_PYTHON',Path(__file__).parent/('data/media-venv/Scripts/python.exe' if os.name=='nt' else 'data/media-venv/bin/python')))
+_TOOL_CACHE = {}
+# video-subtitle-remover (AI, NVIDIA) unpacked by scripts\install_ai_eraser.cmd. Its OCR cannot load models from
+# folders with Korean names on Windows, so the installer may put it elsewhere and write the place to data/vsr-path.txt.
+def _ai_root():
+    if os.environ.get('MFLOW_VSR_DIR'):return Path(os.environ['MFLOW_VSR_DIR'])
+    pointer=Path(__file__).parent/'data/vsr-path.txt'
+    try:return Path(pointer.read_text(encoding='utf-8-sig').strip()) if pointer.is_file() else Path(__file__).parent/'data/vsr'
+    except OSError:return Path(__file__).parent/'data/vsr'
+AI_ROOT = _ai_root()
 FONTS_DIR = Path(os.environ.get('MFLOW_FONTS_DIR',Path(__file__).parent/'fonts'))
 FONT_SUFFIXES = ('.ttf','.otf','.ttc')
 _FONT_CACHE = {}
@@ -57,7 +69,7 @@ def state():
         for row in con.execute('SELECT * FROM production_projects ORDER BY updated_at DESC'):
             p=dict(row);p['document']=json.loads(p['document']);projects.append(p)
         for p in projects:p['comment_info']=comment_info(con,p['document'])
-    return {'channels':channels,'projects':projects,'styles':STYLES,'fonts':available_fonts(),'render_available':bool(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(FONT).is_file())}
+    return {'channels':channels,'projects':projects,'styles':STYLES,'fonts':available_fonts(),'letters_ready':letters_ready(),'ai_ready':ai_eraser() is not None,'gpu':gpu_info(),'render_available':bool(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(FONT).is_file())}
 
 
 def comment_info(con,doc):
@@ -81,7 +93,10 @@ def store(p):
     with CONNECT() as con: con.execute('UPDATE production_projects SET title=?,channel_id=?,status=?,document=?,updated_at=? WHERE id=?',(p['title'],p['channel_id'],p['status'],json.dumps(p['document'],ensure_ascii=False),now(),p['id']))
 
 
-def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'band','title_font':'','caption_font':''}
+def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'band','title_font':'','caption_font':'',**{k:0 for k in OFFSETS}}
+# Up/down nudges set in the editor, in 720x1280 design pixels (positive = lower). Saved with the channel template.
+OFFSETS=('title_y','credit_y','caption_y','comment_y')
+OFFSET_LIMIT=300
 
 
 def available_fonts():
@@ -145,6 +160,11 @@ def settings(data):
     if not math.isfinite(result['duration']) or not 1<=result['duration']<=60 or not math.isfinite(result['start']) or not 0<=result['start']<=5400:raise ValueError('길이는 1~60초, 시작은 0~5400초입니다.')
     fonts={f['file'] for f in available_fonts()}
     if any(not isinstance(result[k],str) or (result[k] and result[k] not in fonts) for k in ('title_font','caption_font')):raise ValueError('글씨체를 다시 선택하세요. fonts 폴더에 파일이 있어야 합니다.')
+    try:
+        for k in OFFSETS:
+            result[k]=int(round(float(result[k])))
+            if not -OFFSET_LIMIT<=result[k]<=OFFSET_LIMIT:raise ValueError
+    except (ValueError,TypeError,OverflowError):raise ValueError(f'위치 조정은 -{OFFSET_LIMIT}~{OFFSET_LIMIT} 사이로 입력하세요.') from None
     if result['style'] not in STYLES or result['layout'] not in LAYOUTS or any(type(result[k]) is not bool for k in ('mute','mirror','captions')):raise ValueError('스타일 설정을 확인하세요.')
     return result
 
@@ -156,6 +176,17 @@ def create_channel(data):
     ident=uuid.uuid4().hex
     with CONNECT() as con:con.execute('INSERT INTO production_channels VALUES (?,?,?,?,?)',(ident,name,language,json.dumps(default_settings()),now()))
     return ident
+
+
+def shown_credit(doc):
+    """The credit text that goes on screen; empty when the user switched it off."""
+    return doc.get('credit','') if doc.get('credit_on',True) else ''
+
+
+def credit_line(channel):
+    """Default credit under the title: '출처. 채널명' (60 characters at most)."""
+    name=re.sub(r'\s+',' ',str(channel or '')).strip()
+    return ('출처. '+name)[:60].rstrip() if name and name not in ('작성자 미제공',) else ''
 
 
 @serialized
@@ -170,10 +201,11 @@ def create_project(data):
     doc={'settings':settings(json.loads(channel['template'])),'script':'','headline':headline,'source':None,'approved_hash':None,'message':'원본 영상을 업로드하세요.','source_url':'','context':''}
     if data.get('source_video_id'):
         with CONNECT() as con:
-            video=con.execute('SELECT url FROM videos WHERE id=?',(str(data['source_video_id']),)).fetchone()
+            video=con.execute('SELECT url,channel FROM videos WHERE id=?',(str(data['source_video_id']),)).fetchone()
             note=con.execute('SELECT notes,attribution FROM research WHERE video_id=?',(str(data['source_video_id']),)).fetchone()
         if not video:raise ValueError('발굴한 영상을 찾을 수 없습니다.')
         doc['source_url']=video['url']
+        doc['credit']=credit_line(video['channel'])
         doc['context']=((note['attribution']+'\n'+note['notes']).strip() if note else '')[:2000]
         doc['source_video_id']=str(data['source_video_id'])
     with CONNECT() as con:con.execute('INSERT INTO production_projects VALUES (?,?,?,?,?,?,?)',(ident,title,channel_id,'draft',json.dumps(doc,ensure_ascii=False),now(),now()))
@@ -188,7 +220,7 @@ def update_project(data):
     script=str(data.get('script',doc['script'])).strip();headline=str(data.get('headline',doc['headline'])).strip()
     context=str(data.get('context',doc.get('context',''))).strip()
     source_url=str(data.get('source_url',doc.get('source_url',''))).strip()
-    credit=re.sub(r'\s+',' ',str(data.get('credit',doc.get('credit','')))).strip();cards=comments(data.get('comments',doc.get('comments',[])))
+    credit=re.sub(r'\s+',' ',str(data.get('credit',doc.get('credit','')))).strip();cards=comments(data.get('comments',doc.get('comments',[])));boxes=blurs(data.get('blurs',doc.get('blurs',[])));timeline=cues(data.get('cues',doc.get('cues',[])))
     if len(credit)>60:raise ValueError('출처 표시는 60자 이내로 입력하세요.')
     if len(textwrap.wrap(headline,18))>3:raise ValueError('상단 제목은 화면에서 3줄(약 50자) 이내여야 합니다. 줄여서 입력하세요.')
     if not title or len(title)>100 or not headline or len(headline)>60 or len(script)>800 or len(context)>2000 or len(source_url)>2048:raise ValueError('이름 100자·상단 제목 60자·대본 800자·맥락 메모 2000자 이내로 입력하세요.')
@@ -196,10 +228,14 @@ def update_project(data):
         from urllib.parse import urlsplit
         u=urlsplit(source_url)
         if u.scheme!='https' or not u.hostname or u.username or u.password:raise ValueError('출처는 HTTPS 링크로 입력하세요.')
+<<<<<<< HEAD
     if script != doc['script']:
         doc.pop('narration',None)
     doc.pop('qa_report',None)
     p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'comments':cards,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
+=======
+    p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'credit_on':bool(data.get('credit_on',doc.get('credit_on',True))),'comments':cards,'blurs':boxes,'cues':timeline,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
+>>>>>>> 48d170d85a7c8d1866ab63fa8562473e23c0d6ef
     doc.pop('output',None);doc.pop('archive',None)
     p['status']='script_ready' if script and doc['source'] else 'source_ready' if doc['source'] else 'draft'
     doc['message']='대본과 설정을 검토한 뒤 승인하세요.' if p['status']=='script_ready' else '원본과 대본을 준비하세요.'
@@ -254,9 +290,253 @@ def save_source(project_id,path,info):
 def fingerprint(doc):
     # credit/comments only count when set, so projects approved before they existed stay approved.
     data={k:doc.get(k) for k in ('source','script','headline','settings')}
+<<<<<<< HEAD
     data.update({k:doc[k] for k in ('credit','comments') if doc.get(k)})
     data.update({k:doc[k] for k in ('analysis','generated_script') if doc.get(k)})
+=======
+    data.update({k:doc[k] for k in ('credit','comments','blurs','cues') if doc.get(k)})
+    if doc.get('credit_on') is False:data['credit_on']=False
+>>>>>>> 48d170d85a7c8d1866ab63fa8562473e23c0d6ef
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+
+MAX_BLURS=6
+def blurs(value):
+    """Validate blur boxes that hide text burned into the source: {'x','y','w','h'} as 0~1 of the 1080x1920 frame, 'start'/'end' seconds (end 0 = to the end)."""
+    if not isinstance(value,list) or len(value)>MAX_BLURS:raise ValueError(f'블러 박스는 최대 {MAX_BLURS}개입니다.')
+    result=[]
+    for item in value:
+        if not isinstance(item,dict):raise ValueError('블러 박스 형식을 확인하세요.')
+        try:box={k:float(item.get(k) or 0) for k in ('x','y','w','h','start','end')}
+        except (TypeError,ValueError):raise ValueError('블러 박스 값은 숫자로 입력하세요.') from None
+        if not all(math.isfinite(v) for v in box.values()):raise ValueError('블러 박스 값은 숫자로 입력하세요.')
+        box['x'],box['y']=min(max(box['x'],0),1),min(max(box['y'],0),1)
+        box['w'],box['h']=min(max(box['w'],0),1-box['x']),min(max(box['h'],0),1-box['y'])
+        if box['w']*WIDTH<16 or box['h']*HEIGHT<16:continue  # too small to matter
+        if not 0<=box['start']<=60 or not 0<=box['end']<=60 or (box['end'] and box['end']<=box['start']):raise ValueError('블러 시간은 0~60초이고, 끝 시간은 시작보다 뒤여야 합니다(0이면 끝까지).')
+        mode=item.get('mode') or 'erase'
+        if mode not in BLUR_MODES:raise ValueError('가리기 방식을 다시 고르세요.')
+        result.append({**{k:round(v,4) for k,v in box.items()},'mode':mode})
+    return result
+
+
+BLUR_MODES=('erase','blur','text','ai')
+PRE_MODES=('text','ai')  # handled outside FFmpeg, before the blur graph
+FEATHER=px(11)  # soft edge so the box outline does not show
+
+
+def blur_graph(chain,boxes,duration):
+    """Filter graph that hides each box on the laid-out frame, before the title and captions are drawn on top.
+
+    erase: delogo fills the box from the pixels around it, so the text looks gone rather than smudged.
+    blur: strong box blur. Both fade out over FEATHER pixels at the edges.
+    """
+    if not boxes:return chain
+    graph=[f'{chain},format=yuv420p[v0]']
+    for i,box in enumerate(boxes):
+        # delogo needs a band of real pixels around the box, so keep it 2px inside the frame.
+        x=min(max(round(box['x']*WIDTH),2),WIDTH-18);y=min(max(round(box['y']*HEIGHT),2),HEIGHT-18)
+        w=min(max(16,round(box['w']*WIDTH)),WIDTH-2-x);h=min(max(16,round(box['h']*HEIGHT)),HEIGHT-2-y)
+        left,top=min(FEATHER,x),min(FEATHER,y);right,bottom=min(FEATHER,WIDTH-x-w),min(FEATHER,HEIGHT-y-h)
+        cx,cy,cw,ch=x-left,y-top,w+left+right,h+top+bottom
+        if box.get('mode','erase')=='erase':hide=f'delogo=x={left}:y={top}:w={w}:h={h},gblur=sigma=6:sigmaV=1.5'  # mostly sideways: smooths delogo's vertical streaks
+        else:hide=f'boxblur={max(2,min(px(14),min(cw,ch)//4-1))}:3'  # boxblur radius must fit the (chroma) size
+        # alphamerge reads the mask's luma. Keep it yuv420p: split forces one format on both branches, and gray would make the whole video gray.
+        mask=f"geq=lum='255*min(1,min(min(X,W-1-X),min(Y,H-1-Y))/{FEATHER})':cb=128:cr=128"
+        on=f"between(t,{box['start']},{box['end'] or duration+1})"
+        graph.append(f"[v{i}]split[m{i}][s{i}];[s{i}]crop={cw}:{ch}:{cx}:{cy},split[k{i}][q{i}];[q{i}]{mask}[a{i}];[k{i}]{hide}[h{i}];[h{i}][a{i}]alphamerge[f{i}];[m{i}][f{i}]overlay={cx}:{cy}:enable='{on}'[v{i+1}]")
+    return ';'.join(graph)+f';[v{len(boxes)}]null'
+
+
+class ToolError(ValueError):
+    """A text-removal step failed; its message is shown to the user as is."""
+
+
+def letters_ready():
+    """Whether the letters-only eraser can run (media venv with OpenCV). Cached for a minute."""
+    import time
+    cached=_TOOL_CACHE.get('letters')
+    if cached and time.time()-cached[0]<60:return cached[1]
+    ok=False
+    if MEDIA_PYTHON.is_file():
+        try:ok=subprocess.run([str(MEDIA_PYTHON),'-c','import cv2,numpy'],capture_output=True,timeout=30).returncode==0
+        except (OSError,subprocess.SubprocessError):ok=False
+    _TOOL_CACHE['letters']=(time.time(),ok);return ok
+
+
+def gpu_info():
+    """Graphics cards on this PC, to suggest the right text-removal method. Read once per run."""
+    if 'gpu' in _TOOL_CACHE:return _TOOL_CACHE['gpu']
+    names=[];nvidia=False
+    try:
+        result=subprocess.run(['nvidia-smi','--query-gpu=name,memory.total','--format=csv,noheader'],capture_output=True,text=True,timeout=10)
+        if result.returncode==0:
+            names=[line.strip() for line in result.stdout.splitlines() if line.strip()];nvidia=bool(names)
+    except (OSError,subprocess.SubprocessError):pass
+    if not names and os.name=='nt':
+        try:
+            result=subprocess.run(['powershell','-NoProfile','-Command','(Get-CimInstance Win32_VideoController).Name'],capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=20)
+            names=[line.strip() for line in result.stdout.splitlines() if line.strip()]
+        except (OSError,subprocess.SubprocessError):pass
+    info={'names':names[:4],'nvidia':nvidia or any('nvidia' in n.lower() for n in names)}
+    _TOOL_CACHE['gpu']=info;return info
+
+
+def erase_letters(task):
+    """Run text_eraser.py in the media venv. Returns its stdout (PNG bytes in frame mode)."""
+    if not letters_ready():raise ToolError('글자만 지우기(정밀)를 쓰려면 scripts\\install_windows.cmd 를 한 번 다시 실행해 OpenCV를 설치하세요.')
+    task={'width':WIDTH,'height':HEIGHT,'formats':SOURCE_FORMATS,**task}
+    result=subprocess.run([str(MEDIA_PYTHON),str(Path(__file__).parent/'text_eraser.py')],input=json.dumps(task).encode('utf-8'),capture_output=True,timeout=900)
+    if result.returncode:raise ToolError('글자만 지우기 처리에 실패했어요. 원본 영상과 박스 위치를 확인하세요.')
+    return result.stdout
+
+
+def ai_eraser():
+    """(python, folder) of video-subtitle-remover under data/vsr, or None. Cached for a minute."""
+    import time
+    cached=_TOOL_CACHE.get('ai')
+    if cached and time.time()-cached[0]<60:return cached[1]
+    found=None
+    if AI_ROOT.is_dir():
+        for main in [m for pattern in ('backend/main.py','*/backend/main.py','*/*/backend/main.py') for m in AI_ROOT.glob(pattern)]:
+            root=main.parent.parent
+            if os.environ.get('MFLOW_VSR_PYTHON'):candidates=[Path(os.environ['MFLOW_VSR_PYTHON'])]
+            else:candidates=[root/name for name in ('python/python.exe','python.exe','runtime/python.exe','.venv/Scripts/python.exe','venv/Scripts/python.exe','.venv/bin/python','venv/bin/python')]+sorted(root.glob('*/python.exe'))+sorted(AI_ROOT.glob('python.exe'))+sorted(AI_ROOT.glob('*/python.exe'))
+            python=next((c for c in candidates if c.is_file()),None)
+            if python:found=(python,root);break
+    _TOOL_CACHE['ai']=(time.time(),found);return found
+
+
+def erase_ai(source,output,boxes,log=None):
+    """Remove subtitles inside the boxes with video-subtitle-remover.
+
+    Video: STTN with OCR detection (sttn-det), so only frames that really show text are repainted.
+    Picture (preview): the tool always uses OCR + LaMa. Box times are not passed: detection finds when text is shown.
+    """
+    tool=ai_eraser()
+    if not tool:raise ToolError('AI 자막 지우기를 쓰려면 scripts\\install_ai_eraser.cmd 를 먼저 실행하세요.')
+    python,root=tool;source,output=Path(source),Path(output)
+    # Work on copies inside the tool's own (ASCII) folder: its video reader fails on Korean paths on Windows.
+    work=Path(tempfile.mkdtemp(dir=AI_ROOT));staged_in,staged_out=work/('in'+source.suffix),work/('out'+output.suffix)
+    try:
+        shutil.copyfile(source,staged_in)
+        _run_ai(python,root,staged_in,staged_out,boxes,log)
+        shutil.move(str(staged_out),str(output))
+    finally:shutil.rmtree(work,ignore_errors=True)
+
+
+def _run_ai(python,root,source,output,boxes,log):
+    command=[str(python),'backend/main.py','-i',str(source),'-o',str(output),'--inpaint-mode','sttn-det']
+    for box in boxes:
+        x,y=round(box['x']*WIDTH),round(box['y']*HEIGHT);w,h=round(box['w']*WIDTH),round(box['h']*HEIGHT)
+        command+=['-c',str(max(y,0)),str(min(y+h,HEIGHT)),str(max(x,0)),str(min(x+w,WIDTH))]
+    env={**os.environ,'PYTHONUTF8':'1','PYTHONIOENCODING':'utf-8','QT_QPA_PLATFORM':'offscreen','PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK':'True'}
+    try:result=subprocess.run(command,cwd=root,capture_output=True,env=env,timeout=3600)
+    except subprocess.TimeoutExpired:raise ToolError('AI 자막 지우기가 1시간 안에 끝나지 않았어요.') from None
+    text=(result.stdout+result.stderr).decode('utf-8','replace')
+    if log:Path(log).write_text(text,encoding='utf-8')
+    if output.is_file() and output.stat().st_size:return
+    if 'No subtitles detected' in text:shutil.copyfile(source,output);return  # nothing to remove in the boxes
+    raise ToolError('AI 자막 지우기에 실패했어요. 그래픽카드 드라이버와 박스 위치를 확인하세요.'+(f' (기록: {log})' if log else ''))
+
+
+def layout_frame(source,seek,vf,output):
+    """One laid-out 1080×1920 PNG frame, before any box is applied."""
+    command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-ss',str(seek),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source),'-frames:v','1','-vf',','.join(vf) or 'null',str(output)]
+    if subprocess.run(command,capture_output=True,timeout=60).returncode or not Path(output).is_file():raise ValueError('미리보기 화면을 만들지 못했어요. 원본 영상과 시작 시간을 확인하세요.')
+
+
+IMAGE_FORMATS='image2,png_pipe'
+
+
+def preview_frame(project_id,at):
+    """One PNG frame of the source with layout and blur boxes applied, to check the boxes before rendering."""
+    p=project(project_id);doc=p['document'];cfg=doc['settings']
+    if not doc.get('source'):raise ValueError('원본 영상을 먼저 업로드하세요.')
+    duration=min(cfg['duration'],doc['source']['duration']-cfg['start'])
+    at=float(at)
+    if not math.isfinite(at):at=0
+    at=min(max(at,0),max(duration-0.05,0))
+    vf=layout_filters(cfg.get('layout','fill'))
+    if cfg['mirror']:vf.append('hflip')
+    # -ss before -i resets t to 0, so shift the box times by the same amount.
+    boxes=[{**b,'start':b['start']-at,'end':(b['end']-at) if b['end'] else 0} for b in doc.get('blurs') or [] if not b['end'] or b['end']>at]
+    boxes=[{**b,'start':max(b['start'],0),'end':max(b['end'],0.01) if b['end'] else 0} for b in boxes]
+    active=lambda b:b['start']<=at and (not b['end'] or at<b['end'])
+    letters=[b for b in doc.get('blurs') or [] if b.get('mode')=='text']
+    ai=[b for b in doc.get('blurs') or [] if b.get('mode')=='ai' and active(b)]
+    boxes=[b for b in boxes if b.get('mode') not in PRE_MODES]
+    source,start,formats=PROJECT_ROOT/project_id/doc['source']['filename'],cfg['start'],SOURCE_FORMATS
+    with tempfile.TemporaryDirectory() as tmp:
+        if ai:
+            # The AI tool works on the laid-out frame; the steps below then start from its result.
+            laid,source=Path(tmp)/'frame.png',Path(tmp)/'clean.png'
+            layout_frame(PROJECT_ROOT/project_id/doc['source']['filename'],cfg['start']+at,vf,laid)
+            erase_ai(laid,source,ai)
+            vf,start,at,formats=[],0,0,IMAGE_FORMATS
+            letters=[{**b,'start':0,'end':0} for b in letters if active(b)]
+        if letters:
+            png=erase_letters({'mode':'frame','source':str(source),'start':start,'at':at,'chain':blur_graph(','.join(vf) or 'null',boxes,1),'boxes':letters,'formats':formats})
+            if not png.startswith(b'\x89PNG'):raise ValueError('미리보기 화면을 만들지 못했어요.')
+            return png
+        graph=blur_graph(','.join(vf) or 'null',boxes,1)+',scale=540:-2'
+        command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-ss',str(start+at),'-format_whitelist',formats,'-protocol_whitelist','file','-i',str(source),'-frames:v','1','-vf',graph,'-f','image2pipe','-c:v','png','-']
+        result=subprocess.run(command,capture_output=True,timeout=60)
+    if result.returncode or not result.stdout:raise ValueError('미리보기 화면을 만들지 못했어요. 원본 영상과 시작 시간을 확인하세요.')
+    return result.stdout
+
+
+# Caption timeline: each script line with its own time, place and look (empty = equal split of the script).
+CUE_POSITIONS=('bottom','middle','top')
+CUE_LOOKS={'outline':'Caption','box':'CaptionBox','accent':'CaptionAccent','lyric':'Lyric'}
+CUE_ACCENT='#ffe34a'
+MAX_CUES=40
+def cues(value):
+    """Validate timeline lines: {'text','sub','start','end','pos','look','y'}. end 0 = until the next line."""
+    if not isinstance(value,list) or len(value)>MAX_CUES:raise ValueError(f'자막 타임라인은 최대 {MAX_CUES}줄입니다.')
+    result=[]
+    for item in value:
+        if not isinstance(item,dict):raise ValueError('자막 타임라인 형식을 확인하세요.')
+        text=re.sub(r'\s+',' ',str(item.get('text',''))).strip();sub=re.sub(r'\s+',' ',str(item.get('sub',''))).strip()
+        if not text:continue
+        try:start,end,y=float(item.get('start') or 0),float(item.get('end') or 0),int(round(float(item.get('y') or 0)))
+        except (TypeError,ValueError,OverflowError):raise ValueError('자막 시점은 숫자로 입력하세요.') from None
+        pos=item.get('pos') or 'bottom';look=item.get('look') or 'outline'
+        if len(text)>60 or len(sub)>60:raise ValueError('자막 한 줄은 60자 이내로 입력하세요.')
+        if not all(math.isfinite(v) for v in (start,end)) or not 0<=start<=60 or not 0<=end<=60 or (end and end<=start):raise ValueError('자막 시점은 0~60초이고, 끝은 시작보다 뒤여야 합니다(0이면 다음 줄까지).')
+        if pos not in CUE_POSITIONS or look not in CUE_LOOKS or not -OFFSET_LIMIT<=y<=OFFSET_LIMIT:raise ValueError('자막 위치와 모양을 다시 고르세요.')
+        result.append({'text':text,'sub':sub,'start':round(start,2),'end':round(end,2),'pos':pos,'look':look,'y':y})
+    return sorted(result,key=lambda c:c['start'])
+
+
+def cue_lines(text):
+    """Wrap one timeline line like the captions (about 12 characters a line, 3 lines at most)."""
+    lines,line=[],[]
+    for word in caption_words(text):
+        if line and sum(len(w)+1 for w,_ in line)+len(word[0])>CAPTION_LINE_CHARS:lines.append(line);line=[]
+        line.append(word)
+    if line:lines.append(line)
+    return lines[:3]
+
+
+def cue_events(items,style,layout,duration,shift=0):
+    """ASS events and SRT text for the caption timeline."""
+    video_bottom=HEIGHT if layout=='fill' else VIDEO_BOTTOM
+    anchors={'top':(8,TITLE_HEIGHT+px(40)),'middle':(5,(TITLE_HEIGHT+video_bottom)//2),'bottom':(2,CAPTION_BOTTOM.get(layout,CAPTION_BOTTOM['band']))}
+    events,srt=[],[]
+    for index,cue in enumerate(items):
+        start=min(cue['start'],duration);end=cue['end'] or (items[index+1]['start'] if index+1<len(items) else duration+1)
+        end=min(end,duration+1)
+        if end<=start:continue
+        name=CUE_LOOKS[cue['look']];base=CUE_ACCENT if cue['look']=='accent' else style['caption'] if cue['look'] in ('outline','box') else '#ffffff'
+        mark=style['highlight'] if cue['look']!='accent' else style['caption']
+        text=r'\N'.join(' '.join(('{\\c'+ass_color(mark)+'}'+ass_text(w)+'{\\c'+ass_color(base)+'}') if marked else ass_text(w) for w,marked in line) for line in cue_lines(cue['text']))
+        if cue['sub']:text+=r'\N{\fs'+str(px(26))+r'\i0\c'+ass_color('#ffffff')+'}'+ass_text(cue['sub'])
+        align,y=anchors[cue['pos']]
+        events.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},{name},,0,0,0,,{{\\an{align}\\pos({WIDTH//2},{y+px(cue["y"])+shift})}}{text}')
+        plain=cue['text'].replace('*','')+('\n'+cue['sub'] if cue['sub'] else '')
+        srt.extend([str(len(srt)//4+1),f'{srt_time(start)} --> {srt_time(min(end,duration))}',plain,''])
+    return events,'\n'.join(srt)
 
 
 def comments(value):
@@ -382,9 +662,9 @@ def rounded_box(w,h,r):
     return f'm {r} 0 l {w-r} 0 b {w} 0 {w} 0 {w} {r} l {w} {h-r} b {w} {h} {w} {h} {w-r} {h} l {r} {h} b 0 {h} 0 {h} 0 {h-r} l 0 {r} b 0 0 0 0 {r} 0'
 
 
-def comment_events(cards,layout,duration):
+def comment_events(cards,layout,duration,shift=0):
     """Comment cards, each shown from its 'at' time until the next card (or the end)."""
-    events=[];top=COMMENT_TOP.get(layout,COMMENT_TOP['band']);width=WIDTH-2*COMMENT_MARGIN;left=COMMENT_MARGIN
+    events=[];top=COMMENT_TOP.get(layout,COMMENT_TOP['band'])+shift;width=WIDTH-2*COMMENT_MARGIN;left=COMMENT_MARGIN
     for index,card in enumerate(cards):
         start=min(card['at'],duration);end=cards[index+1]['at'] if index+1<len(cards) else duration+1
         if end<=start:continue
@@ -401,21 +681,26 @@ def comment_events(cards,layout,duration):
     return events
 
 
-def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layout='band'):
+def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layout='band',offsets=None):
     """Build the ASS subtitle file (headline + narration captions) and the matching SRT text."""
+    shift={k:px((offsets or {}).get(k) or 0) for k in OFFSETS}
     lines,size=title_lines(doc['headline'])
     title=r'\N'.join(('{\\c'+ass_color(style['title' if i==0 else 'title2'])+'}')+ass_text(line) for i,line in enumerate(lines))
     title_family,title_bold=ass_font(title_font or FONT);caption_family,caption_bold=ass_font(caption_font or FONT);ui_family,ui_bold=ass_font(FONT)
-    credit=doc.get('credit','');title_bottom=TITLE_HEIGHT-(px(46) if credit else px(26))
+    credit=shown_credit(doc);title_bottom=TITLE_HEIGHT-(px(46) if credit else px(26))
     ass=['[Script Info]','ScriptType: v4.00+',f'PlayResX: {WIDTH}',f'PlayResY: {HEIGHT}','WrapStyle: 2','ScaledBorderAndShadow: yes','',
          '[V4+ Styles]','Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
          f'Style: Title,{title_family},{size},{ass_color(style["title"])},&H000000FF&,&H00000000&,&H00000000&,{title_bold},0,0,0,100,100,0,0,1,{TITLE_OUTLINE},0,2,0,0,0,1',
          f'Style: Caption,{caption_family},{CAPTION_FONT},{ass_color(style["caption"])},&H000000FF&,&H00000000&,&H80000000&,{caption_bold},0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},{px(2)},2,0,0,0,1',
+         f'Style: CaptionBox,{caption_family},{px(40)},{ass_color(style["caption"])},&H000000FF&,&H20000000&,&H00000000&,{caption_bold},0,0,0,100,100,0,0,3,{px(10)},0,2,0,0,0,1',
+         f'Style: CaptionAccent,{caption_family},{CAPTION_FONT},{ass_color(CUE_ACCENT)},&H000000FF&,&H00000000&,&H80000000&,{caption_bold},0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},{px(2)},2,0,0,0,1',
+         f'Style: Lyric,{caption_family},{px(32)},&H00FFFFFF&,&H000000FF&,&H00000000&,&H80000000&,0,-1,0,0,100,100,0,0,1,{px(3)},{px(1)},2,0,0,0,1',
          f'Style: Credit,{ui_family},{CREDIT_FONT},&H00D8D8D8&,&H000000FF&,&H00000000&,&H00000000&,0,0,0,0,100,100,0,0,1,{px(1)},0,2,0,0,0,1',
          f'Style: Card,{ui_family},20,&H00FFFFFF&,&H000000FF&,&H00000000&,&H60000000&,0,0,0,0,100,100,0,0,1,0,{px(3)},7,0,0,0,1',
          f'Style: CommentName,{ui_family},{COMMENT_NAME_FONT},&H00707070&,&H000000FF&,&H00000000&,&H00000000&,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
          f'Style: Comment,{ui_family},{COMMENT_FONT},&H00141414&,&H000000FF&,&H00000000&,&H00000000&,{ui_bold},0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
          '','[Events]','Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+<<<<<<< HEAD
          f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{title_bottom})}}{title}']
     if credit:ass.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Credit,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT-px(12)})}}{ass_text(credit)}')
     ass.extend(comment_events(doc.get('comments') or [],layout,duration))
@@ -431,9 +716,21 @@ def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layo
         chunks=caption_chunks(doc['script'])
         events=[(duration*index/len(chunks),duration*(index+1)/len(chunks),chunk) for index,chunk in enumerate(chunks)]
     for index,(start,end,chunk) in enumerate(events):
+=======
+         f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{title_bottom+shift["title_y"]})}}{title}']
+    if credit:ass.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Credit,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT-px(12)+shift["credit_y"]})}}{ass_text(credit)}')
+    ass.extend(comment_events(doc.get('comments') or [],layout,duration,shift['comment_y']))
+    if doc.get('cues'):
+        events,srt=cue_events(doc['cues'],style,layout,duration,shift['caption_y'])
+        if captions:ass.extend(events)
+        return '\n'.join(ass)+'\n',srt
+    srt=[];chunks=caption_chunks(doc['script'])
+    for index,chunk in enumerate(chunks):
+        start=duration*index/len(chunks);end=duration*(index+1)/len(chunks)
+>>>>>>> 48d170d85a7c8d1866ab63fa8562473e23c0d6ef
         srt.extend([str(index+1),f'{srt_time(start)} --> {srt_time(end)}','\n'.join(' '.join(w for w,_ in line) for line in chunk),''])
         text=r'\N'.join(' '.join(('{\\c'+ass_color(style['highlight'])+'}'+ass_text(w)+'{\\c'+ass_color(style['caption'])+'}') if marked else ass_text(w) for w,marked in line) for line in chunk)
-        if captions:ass.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{{\\pos({WIDTH//2},{CAPTION_BOTTOM.get(layout,CAPTION_BOTTOM["band"])})}}{text}')
+        if captions:ass.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{{\\pos({WIDTH//2},{CAPTION_BOTTOM.get(layout,CAPTION_BOTTOM["band"])+shift["caption_y"]})}}{text}')
     return '\n'.join(ass)+'\n','\n'.join(srt)
 
 
@@ -476,15 +773,32 @@ def render(p):
         style=STYLES[cfg['style']]
         vf=layout_filters(cfg.get('layout','fill'))
         if cfg['mirror']:vf.append('hflip')
+        boxes=doc.get('blurs') or [];letters=[b for b in boxes if b.get('mode')=='text'];ai=[b for b in boxes if b.get('mode')=='ai']
+        source_args=['-ss',str(cfg['start']),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source)]
+        if ai or letters:
+            # These erasers work on the laid-out video outside FFmpeg; their result replaces the source picture.
+            picture=None
+            if ai:
+                laid=run/'laid.mp4'
+                subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y',*source_args,'-t',str(duration),'-map','0:v:0','-an','-vf',','.join(vf+['fps=30']) ,'-c:v','libx264','-preset','veryfast','-crf','14','-pix_fmt','yuv420p',str(laid)],capture_output=True,timeout=900,check=True)
+                picture=run/'ai.mp4';erase_ai(laid,picture,ai,run/'ai_eraser.log')
+            if letters:
+                cleaned=run/'cleaned.mp4'
+                if picture:erase_letters({'mode':'video','source':str(picture),'start':0,'duration':duration,'chain':'null','boxes':letters,'output':str(cleaned)})
+                else:erase_letters({'mode':'video','source':str(source),'start':cfg['start'],'duration':duration,'chain':','.join(vf),'boxes':letters,'output':str(cleaned)})
+                picture=cleaned
+            vf=[];source_args=['-i',str(picture)]+source_args
+        vf=[blur_graph(','.join(vf) or 'null',[b for b in boxes if b.get('mode') not in PRE_MODES],duration)]
         # libass loads the font from its own folder, so it does not depend on the system font setup (fontconfig on Windows).
         title_font=font_path(cfg.get('title_font',''));caption_font=font_path(cfg.get('caption_font',''))
         fonts=run/'fonts';fonts.mkdir()
         for path in {title_font,caption_font,Path(FONT)}:shutil.copyfile(path,fonts/path.name)
-        ass,srt=subtitles(doc,style,duration,cfg['captions'],title_font,caption_font,cfg.get('layout','fill'))
+        ass,srt=subtitles(doc,style,duration,cfg['captions'],title_font,caption_font,cfg.get('layout','fill'),cfg)
         (run/'overlay.ass').write_text(ass,encoding='utf-8')
         vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"ass=filename={filter_path(run/'overlay.ass')}:fontsdir={filter_path(fonts)}"])
         (run/'captions.srt').write_text(srt,encoding='utf-8')
         output=run/'short.mp4'
+<<<<<<< HEAD
         if voice:
             graph=editing.ffmpeg_filters(plan,doc['source'].get('audio',False),cfg['mute'])
             filters=graph['filters']+[f'[{graph["video_label"]}]'+','.join(vf)+'[finished_video]']
@@ -510,6 +824,16 @@ def render(p):
             (run/'qa-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
             archive_files.append('qa-report.json')
             mixed_audio.unlink()
+=======
+        audio=1 if letters or ai else 0
+        command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args,'-t',str(duration),'-map','0:v:0']
+        if not cfg['mute']:command+=['-map',f'{audio}:a:0?']
+        command+=['-vf',','.join(vf),'-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
+        subprocess.run(command,capture_output=True,timeout=480,check=True)
+        result=probe(output)
+        if result['width']!=WIDTH or result['height']!=HEIGHT:raise ValueError('render size')
+        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'manual timeline' if doc.get('cues') else 'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','blurs':doc.get('blurs') or [],'approved_hash':doc['approved_hash']}
+>>>>>>> 48d170d85a7c8d1866ab63fa8562473e23c0d6ef
         (run/'project.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
         with zipfile.ZipFile(run/'project.zip','w',compression=zipfile.ZIP_STORED) as archive:
             for name in archive_files:archive.write(run/name,name)
@@ -520,7 +844,7 @@ def render(p):
     except Exception as exc:
         if not isinstance(exc,(ValueError,OSError,subprocess.SubprocessError)):traceback.print_exc()
         shutil.rmtree(run,ignore_errors=True)
-        p['status']='error';doc['message']='렌더링에 실패했습니다. 원본 형식과 시작 시간·길이를 확인하고 다시 시도하세요.'
+        p['status']='error';doc['message']=str(exc) if isinstance(exc,ToolError) else '렌더링에 실패했습니다. 원본 형식과 시작 시간·길이를 확인하고 다시 시도하세요.'
         try:store(p)
         except Exception:traceback.print_exc()
     finally:LOCK.release()
