@@ -228,6 +228,9 @@ def update_project(data):
         from urllib.parse import urlsplit
         u=urlsplit(source_url)
         if u.scheme!='https' or not u.hostname or u.username or u.password:raise ValueError('출처는 HTTPS 링크로 입력하세요.')
+    if script != doc['script']:
+        doc.pop('narration',None)
+    doc.pop('qa_report',None)
     p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'credit_on':bool(data.get('credit_on',doc.get('credit_on',True))),'comments':cards,'blurs':boxes,'cues':timeline,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
     doc.pop('output',None);doc.pop('archive',None)
     p['status']='script_ready' if script and doc['source'] else 'source_ready' if doc['source'] else 'draft'
@@ -274,6 +277,8 @@ def save_source(project_id,path,info):
     if p['status']=='rendering':raise ValueError('렌더링 중에는 원본을 바꿀 수 없습니다.')
     p['document'].update({'source':{'filename':path.name,**info},'approved_hash':None,'message':'원본 업로드 완료. 스타일과 대본을 준비하세요.'})
     p['document'].pop('output',None);p['document'].pop('archive',None)
+    if p['document'].get('generated_script'):p['document']['script']=''
+    for key in ('analysis','generated_script','narration','qa_report'):p['document'].pop(key,None)
     p['status']='script_ready' if p['document']['script'] else 'source_ready';store(p)
     return info
 
@@ -283,6 +288,7 @@ def fingerprint(doc):
     data={k:doc.get(k) for k in ('source','script','headline','settings')}
     data.update({k:doc[k] for k in ('credit','comments','blurs','cues') if doc.get(k)})
     if doc.get('credit_on') is False:data['credit_on']=False
+    data.update({k:doc[k] for k in ('analysis','generated_script') if doc.get(k)})
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 
@@ -545,6 +551,9 @@ def approve(project_id):
     p=project(project_id);doc=p['document']
     if p['status']=='rendering' or not doc.get('source') or not doc.get('script'):raise ValueError('원본과 대본을 준비한 뒤 승인하세요.')
     if doc['settings']['start']>=doc['source']['duration']:raise ValueError('시작 시간이 원본 길이보다 깁니다.')
+    if doc.get('analysis') or doc.get('generated_script'):
+        import workflow
+        workflow.current_script(doc)
     doc['approved_hash']=fingerprint(doc);doc['message']='대본과 설정이 승인되었습니다. 렌더링을 시작할 수 있습니다.';p['status']='approved';store(p)
 
 
@@ -553,6 +562,11 @@ def start_render(project_id):
     p=project(project_id);doc=p['document']
     if p['status'] not in ('approved','completed','error') or not doc.get('approved_hash') or doc['approved_hash']!=fingerprint(doc):raise ValueError('현재 대본과 설정을 먼저 승인하세요.')
     if not state()['render_available']:raise ValueError('FFmpeg/FFprobe와 한국어 글꼴 설치가 필요합니다.')
+    if doc.get('generated_script'):
+        import workflow
+        workflow.current_script(doc)
+        if not doc.get('narration') or doc['narration'].get('approved_hash') != doc['approved_hash']:
+            raise ValueError('현재 승인된 대본의 나레이션을 먼저 생성하세요.')
     if not LOCK.acquire(blocking=False):raise ValueError('다른 영상이 렌더링 중입니다. 완료 후 다시 시도하세요.')
     p['status']='rendering';doc['message']='세로 영상과 제목·대본 자막을 렌더링하고 있습니다.';store(p)
     threading.Thread(target=render,args=(p,),daemon=True).start()
@@ -681,13 +695,18 @@ def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layo
          f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{title_bottom+shift["title_y"]})}}{title}']
     if credit:ass.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Credit,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT-px(12)+shift["credit_y"]})}}{ass_text(credit)}')
     ass.extend(comment_events(doc.get('comments') or [],layout,duration,shift['comment_y']))
-    if doc.get('cues'):
+    if doc.get('narration'):
+        # Narration wins over the manual timeline: captions follow the measured length of each spoken sentence.
+        events=[event[:3] for event in narration_chunks(doc['narration'])]
+    elif doc.get('cues'):
         events,srt=cue_events(doc['cues'],style,layout,duration,shift['caption_y'])
         if captions:ass.extend(events)
         return '\n'.join(ass)+'\n',srt
-    srt=[];chunks=caption_chunks(doc['script'])
-    for index,chunk in enumerate(chunks):
-        start=duration*index/len(chunks);end=duration*(index+1)/len(chunks)
+    else:
+        chunks=caption_chunks(doc['script'])
+        events=[(duration*index/len(chunks),duration*(index+1)/len(chunks),chunk) for index,chunk in enumerate(chunks)]
+    srt=[]
+    for index,(start,end,chunk) in enumerate(events):
         srt.extend([str(index+1),f'{srt_time(start)} --> {srt_time(end)}','\n'.join(' '.join(w for w,_ in line) for line in chunk),''])
         text=r'\N'.join(' '.join(('{\\c'+ass_color(style['highlight'])+'}'+ass_text(w)+'{\\c'+ass_color(style['caption'])+'}') if marked else ass_text(w) for w,marked in line) for line in chunk)
         if captions:ass.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{{\\pos({WIDTH//2},{CAPTION_BOTTOM.get(layout,CAPTION_BOTTOM["band"])+shift["caption_y"]})}}{text}')
@@ -704,27 +723,57 @@ def srt_time(seconds):
     return f'{hours:02}:{minutes:02}:{seconds:02},{ms:03}'
 
 
+def narration_chunks(voice):
+    """(start, end, chunk) caption events: each spoken sentence's measured window split evenly into its chunks."""
+    events=[]
+    for segment in voice['segments']:
+        chunks=caption_chunks(segment['text']);length=segment['end']-segment['start']
+        for index,chunk in enumerate(chunks):
+            events.append((segment['start']+length*index/len(chunks),segment['start']+length*(index+1)/len(chunks),chunk,segment['sentence_id']))
+    return events
+
+
+def narration_qa_data(doc, plan):
+    """Describe the same caption chunks and source cuts used by the renderer."""
+    voice={**doc['narration'],'segments':[],'captions':[]}
+    for segment,cut in zip(doc['narration']['segments'],plan):
+        voice['segments'].append({**segment,'source_start':cut['source_start'],'source_end':cut['source_end']})
+    for start,end,chunk,sentence_id in narration_chunks(doc['narration']):
+        voice['captions'].append({'sentence_id':sentence_id,'text':'\n'.join(' '.join(w for w,_ in line) for line in chunk),'start':start,'end':end})
+    return voice
+
+
 def render(p):
     doc=p['document'];directory=PROJECT_ROOT/p['id'];run=directory/uuid.uuid4().hex
     try:
         run.mkdir(parents=True)
         source=directory/doc['source']['filename'];cfg=doc['settings'];duration=min(cfg['duration'],doc['source']['duration']-cfg['start'])
+        voice=doc.get('narration');plan=None
+        if voice:
+            import editing
+            import workflow
+            script=workflow.current_script(doc)
+            if voice.get('approved_hash') != doc.get('approved_hash'):raise ValueError('stale narration')
+            plan=editing.build_plan(doc['analysis'],script,voice,doc['source']['duration'])
+            duration=voice['duration']
         style=STYLES[cfg['style']]
         vf=layout_filters(cfg.get('layout','fill'))
         if cfg['mirror']:vf.append('hflip')
         boxes=doc.get('blurs') or [];letters=[b for b in boxes if b.get('mode')=='text'];ai=[b for b in boxes if b.get('mode')=='ai']
-        source_args=['-ss',str(cfg['start']),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source)]
+        # With narration the edit plan cuts scenes by their own source times, so read the source from 0 up to the last cut.
+        clip_start,clip_length=(0,max(cut['source_end'] for cut in plan)) if voice else (cfg['start'],duration)
+        source_args=['-ss',str(clip_start),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source)]
         if ai or letters:
             # These erasers work on the laid-out video outside FFmpeg; their result replaces the source picture.
             picture=None
             if ai:
                 laid=run/'laid.mp4'
-                subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y',*source_args,'-t',str(duration),'-map','0:v:0','-an','-vf',','.join(vf+['fps=30']) ,'-c:v','libx264','-preset','veryfast','-crf','14','-pix_fmt','yuv420p',str(laid)],capture_output=True,timeout=900,check=True)
+                subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y',*source_args,'-t',str(clip_length),'-map','0:v:0','-an','-vf',','.join(vf+['fps=30']) ,'-c:v','libx264','-preset','veryfast','-crf','14','-pix_fmt','yuv420p',str(laid)],capture_output=True,timeout=900,check=True)
                 picture=run/'ai.mp4';erase_ai(laid,picture,ai,run/'ai_eraser.log')
             if letters:
                 cleaned=run/'cleaned.mp4'
-                if picture:erase_letters({'mode':'video','source':str(picture),'start':0,'duration':duration,'chain':'null','boxes':letters,'output':str(cleaned)})
-                else:erase_letters({'mode':'video','source':str(source),'start':cfg['start'],'duration':duration,'chain':','.join(vf),'boxes':letters,'output':str(cleaned)})
+                if picture:erase_letters({'mode':'video','source':str(picture),'start':0,'duration':clip_length,'chain':'null','boxes':letters,'output':str(cleaned)})
+                else:erase_letters({'mode':'video','source':str(source),'start':clip_start,'duration':clip_length,'chain':','.join(vf),'boxes':letters,'output':str(cleaned)})
                 picture=cleaned
             vf=[];source_args=['-i',str(picture)]+source_args
         vf=[blur_graph(','.join(vf) or 'null',[b for b in boxes if b.get('mode') not in PRE_MODES],duration)]
@@ -737,18 +786,39 @@ def render(p):
         vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"ass=filename={filter_path(run/'overlay.ass')}:fontsdir={filter_path(fonts)}"])
         (run/'captions.srt').write_text(srt,encoding='utf-8')
         output=run/'short.mp4'
-        audio=1 if letters or ai else 0
-        command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args,'-t',str(duration),'-map','0:v:0']
-        if not cfg['mute']:command+=['-map',f'{audio}:a:0?']
-        command+=['-vf',','.join(vf),'-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
+        if voice:
+            # Input 0 = picture (source, or the erased copy), then the source again for its sound, then the narration WAV.
+            audio_input=1 if letters or ai else 0
+            graph=editing.ffmpeg_filters(plan,doc['source'].get('audio',False),cfg['mute'],audio_input=audio_input,narration_input=audio_input+1)
+            filters=graph['filters']+[f'[{graph["video_label"]}]'+','.join(vf)+'[finished_video]']
+            command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args,'-protocol_whitelist','file','-i',str(asset(p['id'],'narration')),'-filter_complex_threads','2','-filter_complex',';'.join(filters),'-t',str(duration),'-map','[finished_video]','-map',f'[{graph["audio_label"]}]']
+        else:
+            audio=1 if letters or ai else 0
+            command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args,'-t',str(duration),'-map','0:v:0']
+            if not cfg['mute']:command+=['-map',f'{audio}:a:0?']
+            command+=['-vf',','.join(vf)]
+        command+=['-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
         subprocess.run(command,capture_output=True,timeout=480,check=True)
         result=probe(output)
         if result['width']!=WIDTH or result['height']!=HEIGHT:raise ValueError('render size')
         manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'manual timeline' if doc.get('cues') else 'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','blurs':doc.get('blurs') or [],'approved_hash':doc['approved_hash']}
+        archive_files=['short.mp4','captions.srt','project.json']
+        if voice:
+            import qa
+            mixed_audio=run/'mixed-audio.wav'
+            subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-i',str(output),'-vn','-c:a','pcm_s16le',str(mixed_audio)],capture_output=True,timeout=60,check=True)
+            report=qa.check_report(doc['analysis'],{**script,'approved':True},narration_qa_data(doc,plan),mixed_audio)
+            report['audio_scope']='rendered_mix'
+            doc['qa_report']=report
+            manifest.update(version=2,analysis=doc['analysis'],generated_script=script,narration=voice,edit_plan=plan,caption_timing='measured sentence WAV duration; chunks within sentence',qa_report=report)
+            (run/'qa-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+            archive_files.append('qa-report.json')
+            mixed_audio.unlink()
         (run/'project.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
         with zipfile.ZipFile(run/'project.zip','w',compression=zipfile.ZIP_STORED) as archive:
-            for name in ('short.mp4','captions.srt','project.json'):archive.write(run/name,name)
+            for name in archive_files:archive.write(run/name,name)
         doc.update({'output':str(output.relative_to(directory)),'archive':str((run/'project.zip').relative_to(directory)),'message':'MP4와 자막·프로젝트 설정 묶음 제작이 완료되었습니다. 원음 유지 방식이며 합성 음성은 없습니다.','render_info':result})
+        if voice:doc['message']='음성 길이에 맞춘 장면·자막과 원음 덕킹을 렌더링했습니다. QA 리포트를 확인하세요.'+(' 모의 음성은 무음입니다.' if voice['mock'] else '')
         shutil.rmtree(fonts,ignore_errors=True)
         p['status']='completed';store(p)
     except Exception as exc:
@@ -769,6 +839,8 @@ def font_file(name):
 def asset(project_id,kind):
     p=project(project_id);doc=p['document'];directory=(PROJECT_ROOT/p['id']).resolve()
     if kind=='source':relative=(doc.get('source') or {}).get('filename')
+    elif kind=='analysis':relative='analysis.json' if doc.get('analysis') else None
+    elif kind=='narration':relative=(doc.get('narration') or {}).get('audio_file')
     elif kind in ('output','archive'):relative=doc.get(kind) if p['status']=='completed' else None
     else:relative=None
     if not relative:raise ValueError('파일이 아직 준비되지 않았습니다.')
