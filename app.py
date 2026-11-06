@@ -10,6 +10,7 @@ import uuid
 import shutil
 import mimetypes
 import production
+import workflow
 import comment_picker
 import os
 import sqlite3
@@ -360,13 +361,13 @@ class Handler(BaseHTTPRequestHandler):
                 if start>end or start>=size:
                     self.send_response(416);self.send_header('Content-Range',f'bytes */{size}');self.end_headers();return
                 status=206
-            mime='application/zip' if path.suffix=='.zip' else 'video/mp4'
+            mime={'.zip':'application/zip','.wav':'audio/wav','.json':'application/json; charset=utf-8'}.get(path.suffix,'video/mp4')
             if path.suffix=='.source':
                 with path.open('rb') as source_file:
                     if source_file.read(4)==b'\x1a\x45\xdf\xa3':mime='video/webm'
             self.send_response(status);self.send_header('Content-Type',mime);self.send_header('Accept-Ranges','bytes');self.send_header('Content-Length',str(end-start+1))
             if status==206:self.send_header('Content-Range',f'bytes {start}-{end}/{size}')
-            if query.get('download')==['1'] or path.suffix=='.zip':self.send_header('Content-Disposition','attachment; filename='+('project.zip' if path.suffix=='.zip' else 'short.mp4'))
+            if query.get('download')==['1'] or path.suffix=='.zip':self.send_header('Content-Disposition','attachment; filename='+{'.zip':'project.zip','.wav':'narration.wav','.json':'analysis.json'}.get(path.suffix,'short.mp4'))
             self.end_headers()
             try:
                 with path.open('rb') as file:
@@ -415,11 +416,23 @@ class Handler(BaseHTTPRequestHandler):
                 query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 info=production.upload(query.get('id',[''])[0],self.rfile,length)
                 return self.send_json({'message':'원본 영상을 업로드했습니다.','source':info})
-            if length < 0 or length > 16384: raise ValueError('요청이 너무 큽니다.')
+            limit = 1024 * 1024 if self.path == '/api/production/analysis' else 16384
+            if length < 0 or length > limit: raise ValueError('요청이 너무 큽니다.')
             data = json.loads(self.rfile.read(length) or b'{}')
             if not isinstance(data,dict): raise ValueError('JSON 객체가 필요합니다.')
             if self.path == '/api/production/channels':return self.send_json({'id':production.create_channel(data)})
             if self.path == '/api/production/projects':return self.send_json({'id':production.create_project(data)})
+            workflow_actions = {
+                '/api/production/analyze': workflow.analyze,
+                '/api/production/confirm-analysis': workflow.confirm_analysis,
+                '/api/production/generate-script': workflow.generate_script,
+                '/api/production/narration': workflow.generate_narration,
+                '/api/production/qa': workflow.check_qa,
+            }
+            if self.path in workflow_actions:
+                return self.send_json(workflow_actions[self.path](str(data.get('id', ''))))
+            if self.path == '/api/production/analysis':
+                return self.send_json(workflow.save_analysis(str(data.get('id', '')), data.get('analysis')))
             if self.path == '/api/production/update':
                 production.update_project(data);return self.send_json({'message':'프로젝트를 저장했습니다. 설정 변경으로 이전 승인은 해제됩니다.'})
             if self.path == '/api/production/comments': return self.send_json(source_comments(str(data.get('id',''))))
@@ -478,7 +491,7 @@ def main():
         con.execute("UPDATE production_projects SET status='error' WHERE status='rendering'")
         con.execute("UPDATE media_jobs SET status='error',code='interrupted',message='서버가 재시작되어 작업이 중단되었습니다. 다시 시도하세요.' WHERE status IN ('queued','running')")
     threading.Thread(target=scheduler,daemon=True).start()
-    server = ThreadingHTTPServer(('127.0.0.1',int(os.environ.get('PORT','8000'))),Handler)
+    server = ThreadingHTTPServer(('127.0.0.1',int(os.environ.get('PORT','8020'))),Handler)
     print('mflowshorts server ready',flush=True)
     server.serve_forever()
 
