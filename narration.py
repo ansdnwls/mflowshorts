@@ -1,0 +1,177 @@
+"""Replaceable Korean TTS engines and measured, sentence-aligned PCM audio.
+
+The default engine deliberately produces silence, not synthesized speech. Set
+MFLOW_TTS_ENGINE=sapi to explicitly use an installed Windows Korean SAPI voice.
+No engine in this module makes an external API call.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+from typing import Protocol
+import wave
+
+
+class TTSEngine(Protocol):
+    name: str
+    mock: bool
+
+    def synthesize(self, text: str, output_path: Path) -> None:
+        """Write one sentence as an uncompressed PCM WAV file."""
+        ...
+
+
+class MockTTS:
+    """Deterministic silent test audio; durations are estimates until measured."""
+
+    name = 'mock-silence'
+    mock = True
+
+    def synthesize(self, text: str, output_path: Path) -> None:
+        duration = max(0.4, len(''.join(text.split())) / 6.0)
+        with wave.open(str(output_path), 'wb') as audio:
+            audio.setparams((1, 2, 24000, 0, 'NONE', 'not compressed'))
+            audio.writeframes(b'\x00\x00' * round(duration * 24000))
+
+
+class WindowsSAPI:
+    """Offline speech using a Korean voice installed on Windows.
+
+    Input text is read from a UTF-8 file, never interpolated as shell code.
+    A missing Korean voice is an error; we do not silently substitute a voice.
+    """
+
+    name = 'windows-sapi-ko-KR'
+    mock = False
+
+    def synthesize(self, text: str, output_path: Path) -> None:
+        if os.name != 'nt':
+            raise ValueError('Windows SAPI 음성 엔진은 Windows에서만 사용할 수 있습니다.')
+        code = r'''
+param([string]$TextPath, [string]$AudioPath)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Speech
+$speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer
+try {
+    $voice = $speaker.GetInstalledVoices() | Where-Object {
+        $_.Enabled -and $_.VoiceInfo.Culture.Name -eq 'ko-KR'
+    } | Select-Object -First 1
+    if ($null -eq $voice) { throw 'Korean SAPI voice is not installed.' }
+    $speaker.SelectVoice($voice.VoiceInfo.Name)
+    $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(24000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)
+    $speaker.SetOutputToWaveFile($AudioPath, $format)
+    $speaker.Speak([System.IO.File]::ReadAllText($TextPath, [System.Text.Encoding]::UTF8))
+} finally { $speaker.Dispose() }
+'''
+        with tempfile.TemporaryDirectory(prefix='mflow-sapi-') as scratch:
+            folder = Path(scratch)
+            text_path, script_path = folder / 'text.txt', folder / 'speak.ps1'
+            text_path.write_text(text, encoding='utf-8')
+            script_path.write_text(code, encoding='utf-8-sig')
+            try:
+                result = subprocess.run(
+                    ['powershell.exe', '-NoProfile', '-NonInteractive',
+                     '-ExecutionPolicy', 'Bypass', '-File', str(script_path),
+                     '-TextPath', str(text_path), '-AudioPath', str(output_path.resolve())],
+                    capture_output=True, timeout=90,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ValueError('Windows 한국어 음성 생성에 실패했습니다. SAPI 설치 상태를 확인하세요.') from exc
+            if result.returncode or not output_path.is_file():
+                raise ValueError('Windows 한국어 SAPI 음성이 필요합니다. 한국어 음성 설치 상태를 확인하세요.')
+
+
+def configured_engine() -> TTSEngine:
+    name = os.environ.get('MFLOW_TTS_ENGINE', 'mock').strip().lower()
+    if name == 'mock':
+        return MockTTS()
+    if name == 'sapi':
+        return WindowsSAPI()
+    raise ValueError('MFLOW_TTS_ENGINE은 mock 또는 sapi여야 합니다.')
+
+
+def script_fingerprint(script: dict) -> str:
+    """Bind generated audio to the exact approved sentence sequence."""
+    value = json.dumps(script.get('sentences'), ensure_ascii=False, sort_keys=True,
+                       separators=(',', ':'), allow_nan=False)
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
+def synthesize(script: dict, output_dir, engine: TTSEngine | None = None) -> dict:
+    """Generate and join sentence WAVs; all timings come from actual frame counts.
+
+    The caller owns approval authentication and should invalidate narration when
+    its project or script changes. This boundary also refuses unapproved scripts.
+    Existing output is replaced only after every sentence has been synthesized.
+    """
+    if not isinstance(script, dict) or script.get('approved') is not True:
+        raise ValueError('승인된 대본만 음성으로 만들 수 있습니다.')
+    sentences = script.get('sentences')
+    if not isinstance(sentences, list) or not 1 <= len(sentences) <= 200:
+        raise ValueError('대본에는 1~200개의 문장이 필요합니다.')
+    seen = set()
+    for sentence in sentences:
+        if not isinstance(sentence, dict):
+            raise ValueError('대본 문장 형식이 올바르지 않습니다.')
+        ident, scene_id, text = (sentence.get(key) for key in ('id', 'scene_id', 'text'))
+        if not isinstance(ident, str) or not ident.strip() or ident in seen:
+            raise ValueError('대본 문장 ID는 비어 있지 않고 고유해야 합니다.')
+        if not isinstance(scene_id, str) or not scene_id.strip():
+            raise ValueError('대본 문장에는 연결된 장면 ID가 필요합니다.')
+        if not isinstance(text, str) or not text.strip() or len(text) > 1000:
+            raise ValueError('각 나레이션 문장은 1~1000자여야 합니다.')
+        seen.add(ident)
+    engine = engine if engine is not None else configured_engine()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='tts-', dir=output_dir) as scratch:
+        staging = Path(scratch)
+        total_frames, format_key, segments = 0, None, []
+        joined = staging / 'narration.wav'
+        with wave.open(str(joined), 'wb') as combined:
+            # Keep error cleanup valid even when the first provider call fails.
+            combined.setparams((1, 2, 24000, 0, 'NONE', 'not compressed'))
+            for index, sentence in enumerate(sentences):
+                path = staging / f'{index:04d}.wav'
+                engine.synthesize(sentence['text'], path)
+                try:
+                    with wave.open(str(path), 'rb') as audio:
+                        key = (audio.getnchannels(), audio.getsampwidth(), audio.getframerate())
+                        frames = audio.getnframes()
+                        if audio.getcomptype() != 'NONE' or key[0] not in (1, 2) or key[1] not in (1, 2, 3, 4) or key[2] <= 0 or frames <= 0:
+                            raise ValueError('TTS 출력은 비어 있지 않은 PCM WAV여야 합니다.')
+                        if frames / key[2] > 180:
+                            raise ValueError('한 문장의 음성은 180초를 넘을 수 없습니다.')
+                        if format_key is None:
+                            format_key = key
+                            combined.setparams((*key, 0, 'NONE', 'not compressed'))
+                        elif format_key != key:
+                            raise ValueError('문장별 TTS 오디오 형식이 일치하지 않습니다.')
+                        pcm = audio.readframes(frames)
+                        if len(pcm) != frames * key[0] * key[1]:
+                            raise ValueError('TTS WAV 파일이 잘렸습니다.')
+                except (OSError, EOFError, wave.Error) as exc:
+                    raise ValueError('TTS 엔진이 유효한 PCM WAV를 만들지 못했습니다.') from exc
+                start = total_frames / key[2]
+                total_frames += frames
+                end = total_frames / key[2]
+                if not math.isfinite(end) or end > 600:
+                    raise ValueError('전체 나레이션은 600초를 넘을 수 없습니다.')
+                combined.writeframes(pcm)
+                segments.append({'sentence_id': sentence['id'], 'scene_id': sentence['scene_id'],
+                                 'text': sentence['text'], 'start': round(start, 6),
+                                 'end': round(end, 6), 'duration': round(frames / key[2], 6)})
+        result = {'engine': engine.name, 'mock': bool(engine.mock), 'audio_file': 'narration.wav',
+                  'duration': round(total_frames / format_key[2], 6), 'segments': segments,
+                  'script_fingerprint': script_fingerprint(script)}
+        manifest = staging / 'narration.json'
+        manifest.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+        joined.replace(output_dir / 'narration.wav')
+        manifest.replace(output_dir / 'narration.json')
+    return result
