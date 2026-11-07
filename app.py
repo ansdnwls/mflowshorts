@@ -10,6 +10,7 @@ import uuid
 import shutil
 import mimetypes
 import production
+import scene_analysis
 import comment_picker
 import os
 import sqlite3
@@ -46,6 +47,7 @@ def connect():
 def init():
     with connect() as con: con.execute('PRAGMA journal_mode=WAL')
     production.init(connect)
+    scene_analysis.init()
     with connect() as con:
         con.executescript('''CREATE TABLE IF NOT EXISTS videos (
           id TEXT PRIMARY KEY, platform TEXT, title TEXT, channel TEXT, url TEXT,
@@ -341,6 +343,14 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError,ConnectionResetError): pass
         except Exception as exc: self.fail(exc)
     def route_get(self):
+        if self.path.startswith('/api/scenes/state?'):
+            query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            return self.send_json(scene_analysis.state(query.get('id',[''])[0]))
+        if self.path.startswith('/api/scenes/frame?'):
+            query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:path=scene_analysis.frame(query.get('id',[''])[0],int(query.get('index',['-1'])[0]))
+            except ValueError:return self.send_error(404)
+            body=path.read_bytes();self.send_response(200);self.send_header('Content-Type','image/jpeg');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body);return
         if self.path == '/api/production/state': return self.send_json(production.state())
         if self.path.startswith('/api/production/font?'):
             query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -407,7 +417,7 @@ class Handler(BaseHTTPRequestHandler):
                 writer.writerow(["'"+str(c) if isinstance(c,str) and c.lstrip().startswith(('=','+','-','@')) else c for c in cells])
             body = ('\ufeff'+output.getvalue()).encode('utf-8')
             self.send_response(200); self.send_header('Content-Type','text/csv; charset=utf-8'); self.send_header('Content-Disposition','attachment; filename=mflow-videos.csv'); self.end_headers(); self.wfile.write(body); return
-        files = {'/':'index.html','/app.js':'app.js','/style.css':'style.css','/production.js':'production.js'}
+        files = {'/':'index.html','/app.js':'app.js','/style.css':'style.css','/production.js':'production.js','/scene-analysis.js':'scene-analysis.js'}
         name = files.get(self.path)
         if not name: return self.send_error(404)
         body = (ROOT/'web'/name).read_bytes()
@@ -423,9 +433,12 @@ class Handler(BaseHTTPRequestHandler):
                 query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 info=production.upload(query.get('id',[''])[0],self.rfile,length)
                 return self.send_json({'message':'원본 영상을 업로드했습니다.','source':info})
-            if length < 0 or length > 16384: raise ValueError('요청이 너무 큽니다.')
+            if length < 0 or length > (131072 if self.path=='/api/scenes/review' else 16384): raise ValueError('요청이 너무 큽니다.')
             data = json.loads(self.rfile.read(length) or b'{}')
             if not isinstance(data,dict): raise ValueError('JSON 객체가 필요합니다.')
+            if self.path == '/api/scenes/start':return self.send_json({'id':scene_analysis.start(str(data.get('project_id','')),data.get('action'),data.get('interval',2))},202)
+            if self.path == '/api/scenes/review':
+                scene_analysis.review(str(data.get('project_id','')),data.get('segments'),data.get('transcript',''),data.get('confirmed',False));return self.send_json({'message':'분석 검토 내용을 저장했습니다.'})
             if self.path == '/api/production/channels':return self.send_json({'id':production.create_channel(data)})
             if self.path == '/api/production/projects':return self.send_json({'id':production.create_project(data)})
             if self.path == '/api/production/update':
@@ -483,6 +496,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     init()
     with connect() as con:
+        con.execute("UPDATE scene_analyses SET status='error',message='서버 재시작으로 분석이 중단됐습니다. 프레임 추출부터 다시 실행하세요.' WHERE status IN ('preparing','analyzing')")
         con.execute("UPDATE production_projects SET status='error' WHERE status='rendering'")
         con.execute("UPDATE media_jobs SET status='error',code='interrupted',message='서버가 재시작되어 작업이 중단되었습니다. 다시 시도하세요.' WHERE status IN ('queued','running')")
     threading.Thread(target=scheduler,daemon=True).start()
