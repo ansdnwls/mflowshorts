@@ -12,6 +12,7 @@ import mimetypes
 import production
 import scene_analysis
 import script_drafts
+import material_library
 import comment_picker
 import os
 import sqlite3
@@ -50,6 +51,7 @@ def init():
     production.init(connect)
     scene_analysis.init()
     script_drafts.init()
+    material_library.init()
     with connect() as con:
         con.executescript('''CREATE TABLE IF NOT EXISTS videos (
           id TEXT PRIMARY KEY, platform TEXT, title TEXT, channel TEXT, url TEXT,
@@ -345,6 +347,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError,ConnectionResetError): pass
         except Exception as exc: self.fail(exc)
     def route_get(self):
+        if self.path == '/api/materials/state':return self.send_json(material_library.state())
         if self.path.startswith('/api/scripts/state?'):
             query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             return self.send_json(script_drafts.state(query.get('id',[''])[0]))
@@ -422,7 +425,7 @@ class Handler(BaseHTTPRequestHandler):
                 writer.writerow(["'"+str(c) if isinstance(c,str) and c.lstrip().startswith(('=','+','-','@')) else c for c in cells])
             body = ('\ufeff'+output.getvalue()).encode('utf-8')
             self.send_response(200); self.send_header('Content-Type','text/csv; charset=utf-8'); self.send_header('Content-Disposition','attachment; filename=mflow-videos.csv'); self.end_headers(); self.wfile.write(body); return
-        files = {'/':'index.html','/app.js':'app.js','/style.css':'style.css','/production.js':'production.js','/scene-analysis.js':'scene-analysis.js','/script-drafts.js':'script-drafts.js'}
+        files = {'/':'index.html','/app.js':'app.js','/style.css':'style.css','/production.js':'production.js','/scene-analysis.js':'scene-analysis.js','/script-drafts.js':'script-drafts.js','/materials.js':'materials.js'}
         name = files.get(self.path)
         if not name: return self.send_error(404)
         body = (ROOT/'web'/name).read_bytes()
@@ -438,9 +441,14 @@ class Handler(BaseHTTPRequestHandler):
                 query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 info=production.upload(query.get('id',[''])[0],self.rfile,length)
                 return self.send_json({'message':'원본 영상을 업로드했습니다.','source':info})
-            if length < 0 or length > (131072 if self.path=='/api/scenes/review' else 16384): raise ValueError('요청이 너무 큽니다.')
+            if length < 0 or length > (131072 if self.path=='/api/scenes/review' else 32768 if self.path=='/api/materials/save' else 16384): raise ValueError('요청이 너무 큽니다.')
             data = json.loads(self.rfile.read(length) or b'{}')
             if not isinstance(data,dict): raise ValueError('JSON 객체가 필요합니다.')
+            if self.path == '/api/materials/collect':return self.send_json({'video_ids':material_library.collect(data.get('video_ids'),data.get('min_views',1000000),data.get('min_ratio',3))})
+            if self.path == '/api/materials/save':
+                material_library.save(data);return self.send_json({'message':'소재 기획을 저장했습니다.'})
+            if self.path == '/api/materials/outcomes':
+                material_library.outcome(data);return self.send_json({'message':'재가공 버전의 성과를 기록했습니다.'})
             if self.path == '/api/scripts/start':return self.send_json({'id':script_drafts.start(str(data.get('project_id','')),data.get('kind'))},202)
             if self.path == '/api/scripts/save':
                 script_drafts.save(str(data.get('id','')),data.get('data'));return self.send_json({'message':'대본 초안 수정을 저장했습니다.'})

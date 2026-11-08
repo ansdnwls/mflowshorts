@@ -208,6 +208,10 @@ def create_project(data):
         doc['credit']=credit_line(video['channel'])
         doc['context']=((note['attribution']+'\n'+note['notes']).strip() if note else '')[:2000]
         doc['source_video_id']=str(data['source_video_id'])
+        with CONNECT() as con:material=con.execute('SELECT hypothesis,angle FROM material_notes WHERE video_id=?',(doc['source_video_id'],)).fetchone()
+        if material:
+            doc['material_brief']={'hypothesis':material['hypothesis'],'angle':material['angle']}
+            doc['context']=('새 해석: '+material['angle']+'\n흥행 이유 가설: '+material['hypothesis']+'\n'+doc['context']).strip()[:2000]
     with CONNECT() as con:con.execute('INSERT INTO production_projects VALUES (?,?,?,?,?,?,?)',(ident,title,channel_id,'draft',json.dumps(doc,ensure_ascii=False),now(),now()))
     return ident
 
