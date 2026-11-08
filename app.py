@@ -11,6 +11,7 @@ import shutil
 import mimetypes
 import production
 import scene_analysis
+import script_drafts
 import comment_picker
 import os
 import sqlite3
@@ -48,6 +49,7 @@ def init():
     with connect() as con: con.execute('PRAGMA journal_mode=WAL')
     production.init(connect)
     scene_analysis.init()
+    script_drafts.init()
     with connect() as con:
         con.executescript('''CREATE TABLE IF NOT EXISTS videos (
           id TEXT PRIMARY KEY, platform TEXT, title TEXT, channel TEXT, url TEXT,
@@ -343,6 +345,9 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError,ConnectionResetError): pass
         except Exception as exc: self.fail(exc)
     def route_get(self):
+        if self.path.startswith('/api/scripts/state?'):
+            query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            return self.send_json(script_drafts.state(query.get('id',[''])[0]))
         if self.path.startswith('/api/scenes/state?'):
             query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             return self.send_json(scene_analysis.state(query.get('id',[''])[0]))
@@ -417,7 +422,7 @@ class Handler(BaseHTTPRequestHandler):
                 writer.writerow(["'"+str(c) if isinstance(c,str) and c.lstrip().startswith(('=','+','-','@')) else c for c in cells])
             body = ('\ufeff'+output.getvalue()).encode('utf-8')
             self.send_response(200); self.send_header('Content-Type','text/csv; charset=utf-8'); self.send_header('Content-Disposition','attachment; filename=mflow-videos.csv'); self.end_headers(); self.wfile.write(body); return
-        files = {'/':'index.html','/app.js':'app.js','/style.css':'style.css','/production.js':'production.js','/scene-analysis.js':'scene-analysis.js'}
+        files = {'/':'index.html','/app.js':'app.js','/style.css':'style.css','/production.js':'production.js','/scene-analysis.js':'scene-analysis.js','/script-drafts.js':'script-drafts.js'}
         name = files.get(self.path)
         if not name: return self.send_error(404)
         body = (ROOT/'web'/name).read_bytes()
@@ -436,6 +441,11 @@ class Handler(BaseHTTPRequestHandler):
             if length < 0 or length > (131072 if self.path=='/api/scenes/review' else 16384): raise ValueError('요청이 너무 큽니다.')
             data = json.loads(self.rfile.read(length) or b'{}')
             if not isinstance(data,dict): raise ValueError('JSON 객체가 필요합니다.')
+            if self.path == '/api/scripts/start':return self.send_json({'id':script_drafts.start(str(data.get('project_id','')),data.get('kind'))},202)
+            if self.path == '/api/scripts/save':
+                script_drafts.save(str(data.get('id','')),data.get('data'));return self.send_json({'message':'대본 초안 수정을 저장했습니다.'})
+            if self.path == '/api/scripts/apply':
+                script_drafts.apply(str(data.get('id','')),data.get('confirmed'));return self.send_json({'message':'제작에 반영했습니다. 렌더링 전 대본·설정을 승인하세요.'})
             if self.path == '/api/scenes/start':return self.send_json({'id':scene_analysis.start(str(data.get('project_id','')),data.get('action'),data.get('interval',2))},202)
             if self.path == '/api/scenes/review':
                 scene_analysis.review(str(data.get('project_id','')),data.get('segments'),data.get('transcript',''),data.get('confirmed',False));return self.send_json({'message':'분석 검토 내용을 저장했습니다.'})
@@ -496,6 +506,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     init()
     with connect() as con:
+        con.execute("UPDATE script_drafts SET status='error',message='서버 재시작으로 생성이 중단됐습니다. 다시 생성하세요.' WHERE status='generating'")
         con.execute("UPDATE scene_analyses SET status='error',message='서버 재시작으로 분석이 중단됐습니다. 프레임 추출부터 다시 실행하세요.' WHERE status IN ('preparing','analyzing')")
         con.execute("UPDATE production_projects SET status='error' WHERE status='rendering'")
         con.execute("UPDATE media_jobs SET status='error',code='interrupted',message='서버가 재시작되어 작업이 중단되었습니다. 다시 시도하세요.' WHERE status IN ('queued','running')")
