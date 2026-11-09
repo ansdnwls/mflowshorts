@@ -441,6 +441,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/production/narration':
                 result = workflow.queue_narration(str(data.get('id', '')))
                 return self.send_json(result, 200 if result['status']=='completed' else 202)
+            if self.path == '/api/production/approve-publish':
+                return self.send_json(workflow.approve_publish(str(data.get('id','')), data.get('reviewed'), data.get('rights_note')))
             if self.path == '/api/production/analysis':
                 return self.send_json(workflow.save_analysis(str(data.get('id', '')), data.get('analysis')))
             if self.path == '/api/production/update':

@@ -247,6 +247,7 @@ def update_project(data):
     if script != doc['script']:
         doc.pop('narration',None)
     doc.pop('qa_report',None)
+    doc.pop('publish_approval',None)
     p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'credit_on':bool(data.get('credit_on',doc.get('credit_on',True))),'comments':cards,'blurs':boxes,'cues':timeline,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
     doc.pop('output',None);doc.pop('archive',None)
     p['status']='script_ready' if script and doc['source'] else 'source_ready' if doc['source'] else 'draft'
@@ -294,7 +295,7 @@ def save_source(project_id,path,info):
     p['document'].update({'source':{'filename':path.name,**info},'approved_hash':None,'message':'원본 업로드 완료. 스타일과 대본을 준비하세요.'})
     p['document'].pop('output',None);p['document'].pop('archive',None)
     if p['document'].get('generated_script'):p['document']['script']=''
-    for key in ('analysis','generated_script','narration','qa_report'):p['document'].pop(key,None)
+    for key in ('analysis','generated_script','narration','qa_report','publish_approval'):p['document'].pop(key,None)
     p['status']='script_ready' if p['document']['script'] else 'source_ready';store(p)
     return info
 
@@ -588,11 +589,16 @@ def start_render(project_id):
         workflow.current_script(doc)
         if not doc.get('narration') or doc['narration'].get('approved_hash') != doc['approved_hash']:
             raise ValueError('현재 승인된 대본의 나레이션을 먼저 생성하세요.')
-    if p['status']=='completed':
+    if p['status']=='completed' and (not doc.get('generated_script') or (doc.get('qa_report') or {}).get('output_sha256')):
         try:
             for kind in ('output','archive'):
                 if not asset(project_id,kind).stat().st_size:
                     raise ValueError('empty render asset')
+            expected=(doc.get('qa_report') or {}).get('output_sha256')
+            if expected:
+                with asset(project_id,'output').open('rb') as video:
+                    if hashlib.file_digest(video,'sha256').hexdigest()!=expected:
+                        raise ValueError('render asset changed')
         except (OSError,ValueError):
             pass
         else:
@@ -615,6 +621,8 @@ def enqueue_job(p, engine=None):
     """Register a validated job while the caller holds CONFIG_LOCK."""
     job_id=uuid.uuid4().hex
     p['status']='rendering'
+    if not engine:
+        p['document'].pop('publish_approval',None)
     message='나레이션 대기열에 등록했습니다.' if engine else '렌더 대기열에 등록했습니다.'
     p['document']['message']=message
     with CONNECT() as con:
@@ -948,6 +956,8 @@ def render(p):
             subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-i',str(output),'-vn','-c:a','pcm_s16le',str(mixed_audio)],capture_output=True,timeout=60,check=True)
             report=qa.check_report(doc['analysis'],{**script,'approved':True},narration_qa_data(doc,plan),mixed_audio)
             report['audio_scope']='rendered_mix'
+            with output.open('rb') as video:
+                report['output_sha256']=hashlib.file_digest(video,'sha256').hexdigest()
             doc['qa_report']=report
             manifest.update(version=2,analysis=doc['analysis'],generated_script=script,narration=voice,edit_plan=plan,caption_timing='manual timeline' if doc.get('cues') else 'measured sentence WAV duration; chunks within sentence',qa_report=report)
             (run/'qa-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')

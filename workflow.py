@@ -20,7 +20,7 @@ def editable(project_id):
 
 def invalidate(doc, script=False):
     doc['approved_hash'] = None
-    for key in ('narration', 'qa_report', 'output', 'archive'):
+    for key in ('narration', 'qa_report', 'output', 'archive', 'publish_approval'):
         doc.pop(key, None)
     if script:
         if doc.pop('generated_script', None):
@@ -115,13 +115,17 @@ def queue_narration(project_id):
     engine_key = os.environ.get('MFLOW_TTS_ENGINE', 'mock').strip().lower()
     engine = narration.configured_engine(engine_key)
     voice = doc.get('narration') or {}
-    if voice.get('approved_hash') == doc['approved_hash'] and voice.get('engine') == engine.name and voice.get('audio_sha256'):
+    if voice.get('approved_hash') == doc['approved_hash'] and voice.get('audio_sha256'):
         try:
             editing.build_plan(doc['analysis'], script, voice, doc['source']['duration'])
-            if audio_digest(production.asset(project_id, 'narration')) == voice['audio_sha256']:
-                return {'status': 'completed', 'narration': voice, 'message': '생성된 나레이션을 다시 사용합니다.'}
+            intact = audio_digest(production.asset(project_id, 'narration')) == voice['audio_sha256']
         except (OSError, ValueError):
-            pass
+            intact = False
+        if not intact:
+            for key in ('narration', 'output', 'archive', 'qa_report', 'publish_approval'):
+                doc.pop(key, None)
+        elif voice.get('engine') == engine.name:
+            return {'status': 'completed', 'narration': voice, 'message': '생성된 나레이션을 다시 사용합니다.'}
     return production.enqueue_job(p, engine_key)
 
 
@@ -150,7 +154,7 @@ def synthesize_narration(p, engine):
     result['audio_file'] = str((run / result['audio_file']).relative_to(production.PROJECT_ROOT / p['id']))
     result['approved_hash'] = doc['approved_hash']
     doc['narration'] = result
-    for key in ('output', 'archive', 'qa_report'):
+    for key in ('output', 'archive', 'qa_report', 'publish_approval'):
         doc.pop(key, None)
     doc['message'] = '모의 음성 타이밍을 만들었습니다. WAV는 무음이며 실제 나레이션이 아닙니다.' if result['mock'] else '한국어 나레이션과 문장별 길이를 저장했습니다.'
     p['status'] = 'approved'
@@ -164,6 +168,9 @@ def check_qa(project_id):
     import editing
     p = editable(project_id)
     doc = p['document']
+    existing = doc.get('qa_report') or {}
+    if p['status']=='completed' and existing.get('audio_scope')=='rendered_mix':
+        return {'qa_report': existing, 'message': '최종 영상의 QA 결과입니다.'}
     script = current_script(doc)
     voice = doc.get('narration')
     if not voice or voice.get('approved_hash') != doc.get('approved_hash') or doc.get('approved_hash') != production.fingerprint(doc):
@@ -175,3 +182,41 @@ def check_qa(project_id):
     doc['qa_report'] = report
     production.store(p)
     return {'qa_report': report, 'message': 'QA 점검을 완료했습니다.'}
+
+
+def check_publish_candidate(p):
+    """Return the identity of the final file that passed QA."""
+    doc = p['document']
+    if p['status'] != 'completed':
+        raise ValueError('완성 영상을 먼저 렌더링하세요.')
+    approved_script(doc)
+    voice = doc.get('narration') or {}
+    if voice.get('mock') is not False or voice.get('approved_hash') != doc['approved_hash']:
+        raise ValueError('현재 승인 대본으로 실제 한국어 나레이션을 생성하세요.')
+    report = doc.get('qa_report') or {}
+    if report.get('audio_scope') != 'rendered_mix' or report.get('passed') is not True or not report.get('output_sha256'):
+        raise ValueError('최종 영상의 QA를 통과해야 합니다. 필요한 경우 다시 렌더링하세요.')
+    if not any(check.get('name')=='audio_clipping' and check.get('status')=='passed' and
+               check.get('metrics', {}).get('peak', 0) > 0 for check in report.get('checks', [])):
+        raise ValueError('최종 영상에서 유효한 오디오를 확인하지 못했습니다.')
+    try:
+        digest = audio_digest(production.asset(p['id'], 'output'))
+    except OSError as exc:
+        raise ValueError('최종 영상 파일을 읽을 수 없습니다.') from exc
+    if digest != report['output_sha256']:
+        raise ValueError('최종 영상이 QA 이후 변경되었습니다. 다시 렌더링하세요.')
+    return digest
+
+
+@production.serialized
+def approve_publish(project_id, reviewed, rights_note):
+    if reviewed is not True:
+        raise ValueError('최종 영상과 음성을 검토했다고 확인하세요.')
+    if not isinstance(rights_note, str) or not 1 <= len(rights_note.strip()) <= 500:
+        raise ValueError('원본 사용 권한의 근거를 1~500자로 입력하세요.')
+    p = production.project(project_id)
+    digest = check_publish_candidate(p)
+    approval = {'output_sha256': digest, 'rights_note': rights_note.strip(), 'approved_at': production.now()}
+    p['document']['publish_approval'] = approval
+    production.store(p)
+    return {'publish_approval': approval, 'message': '검토한 영상의 게시 준비를 승인했습니다.'}

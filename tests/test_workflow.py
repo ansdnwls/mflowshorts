@@ -57,6 +57,39 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(action=action.__name__), self.assertRaises(ValueError):
                 action(self.ident)
 
+    def test_publish_approval_requires_current_final_qa_and_rights(self):
+        self.voiced()
+        p = production.project(self.ident)
+        doc = p['document']
+        p['status'] = 'completed'
+        doc['output'] = 'short.mp4'
+        output = production.PROJECT_ROOT / self.ident / doc['output']
+        output.write_bytes(b'fixture video')
+        doc['qa_report'] = {'passed': True, 'audio_scope': 'rendered_mix',
+                            'output_sha256': workflow.audio_digest(output),
+                            'checks': [{'name': 'audio_clipping', 'status': 'passed', 'metrics': {'peak': 0.5}}]}
+        production.store(p)
+        with self.assertRaisesRegex(ValueError, '실제 한국어'):
+            workflow.approve_publish(self.ident, True, '직접 촬영')
+        doc['narration']['mock'] = False
+        doc['qa_report']['audio_scope'] = 'narration_only'
+        production.store(p)
+        with self.assertRaisesRegex(ValueError, '최종 영상의 QA'):
+            workflow.approve_publish(self.ident, True, '직접 촬영')
+        doc['qa_report']['audio_scope'] = 'rendered_mix'
+        production.store(p)
+        for reviewed, rights in ((False, '직접 촬영'), (True, ' ')):
+            with self.assertRaises(ValueError):
+                workflow.approve_publish(self.ident, reviewed, rights)
+        self.assertEqual(workflow.check_qa(self.ident)['qa_report'], doc['qa_report'])
+        approval = workflow.approve_publish(self.ident, True, '직접 촬영')['publish_approval']
+        self.assertEqual(approval['output_sha256'], doc['qa_report']['output_sha256'])
+        output.write_bytes(b'changed fixture video')
+        with self.assertRaisesRegex(ValueError, 'QA 이후 변경'):
+            workflow.approve_publish(self.ident, True, '직접 촬영')
+        production.update_project({'id': self.ident, 'headline': '새 제목'})
+        self.assertNotIn('publish_approval', self.document())
+
     def test_narration_queue_recovers_and_reuses_only_intact_audio(self):
         self.reviewed()
         production.approve(self.ident)
@@ -79,6 +112,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertFalse(production.process_next_render())
             audio.write_bytes(b'corrupted')
             self.assertEqual(workflow.queue_narration(self.ident)['status'], 'queued')
+            self.assertNotIn('narration', self.document())
             self.assertTrue(production.process_next_render())
             self.assertNotEqual(production.asset(self.ident, 'narration'), audio)
 

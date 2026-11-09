@@ -49,10 +49,7 @@ class WindowsSAPI:
     name = 'windows-sapi-ko-KR'
     mock = False
 
-    def synthesize(self, text: str, output_path: Path) -> None:
-        if os.name != 'nt':
-            raise ValueError('Windows SAPI 음성 엔진은 Windows에서만 사용할 수 있습니다.')
-        code = r'''
+    code = r'''
 param([string]$TextPath, [string]$AudioPath)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Speech
@@ -68,11 +65,15 @@ try {
     $speaker.Speak([System.IO.File]::ReadAllText($TextPath, [System.Text.Encoding]::UTF8))
 } finally { $speaker.Dispose() }
 '''
+
+    def synthesize(self, text: str, output_path: Path) -> None:
+        if os.name != 'nt':
+            raise ValueError('Windows 음성 엔진은 Windows에서만 사용할 수 있습니다.')
         with tempfile.TemporaryDirectory(prefix='mflow-sapi-') as scratch:
             folder = Path(scratch)
             text_path, script_path = folder / 'text.txt', folder / 'speak.ps1'
             text_path.write_text(text, encoding='utf-8')
-            script_path.write_text(code, encoding='utf-8-sig')
+            script_path.write_text(self.code, encoding='utf-8-sig')
             try:
                 result = subprocess.run(
                     ['powershell.exe', '-NoProfile', '-NonInteractive',
@@ -82,9 +83,44 @@ try {
                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
-                raise ValueError('Windows 한국어 음성 생성에 실패했습니다. SAPI 설치 상태를 확인하세요.') from exc
+                raise ValueError('Windows 한국어 음성 생성에 실패했습니다. 음성 설치 상태를 확인하세요.') from exc
             if result.returncode or not output_path.is_file():
-                raise ValueError('Windows 한국어 SAPI 음성이 필요합니다. 한국어 음성 설치 상태를 확인하세요.')
+                raise ValueError('선택한 엔진의 Windows 한국어 음성을 사용할 수 없습니다.')
+
+
+class WindowsOneCore(WindowsSAPI):
+    """Use installed Windows speech voices exposed through WinRT."""
+
+    name = 'windows-onecore-ko-KR'
+    code = r'''
+param([string]$TextPath, [string]$AudioPath)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Media.SpeechSynthesis.SpeechSynthesizer, Windows.Media.SpeechSynthesis, ContentType=WindowsRuntime]
+$resultType = [Windows.Media.SpeechSynthesis.SpeechSynthesisStream, Windows.Media.SpeechSynthesis, ContentType=WindowsRuntime]
+$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.IsGenericMethodDefinition -and
+    $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+} | Select-Object -First 1
+$voice = [Windows.Media.SpeechSynthesis.SpeechSynthesizer]::AllVoices | Where-Object {
+    $_.Language -eq 'ko-KR'
+} | Select-Object -First 1
+if ($null -eq $voice) { throw 'Korean OneCore voice is not installed.' }
+$speaker = New-Object Windows.Media.SpeechSynthesis.SpeechSynthesizer
+try {
+    $speaker.Voice = $voice
+    $text = [System.IO.File]::ReadAllText($TextPath, [System.Text.Encoding]::UTF8)
+    $operation = $speaker.SynthesizeTextToStreamAsync($text)
+    $task = $asTask.MakeGenericMethod($resultType).Invoke($null, @($operation))
+    $stream = $task.GetAwaiter().GetResult()
+    $inputStream = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($stream)
+    try {
+        $outputStream = [System.IO.File]::Create($AudioPath)
+        try { $inputStream.CopyTo($outputStream) }
+        finally { $outputStream.Dispose() }
+    } finally { $inputStream.Dispose() }
+} finally { $speaker.Dispose() }
+'''
 
 
 def configured_engine(name=None) -> TTSEngine:
@@ -93,7 +129,9 @@ def configured_engine(name=None) -> TTSEngine:
         return MockTTS()
     if name == 'sapi':
         return WindowsSAPI()
-    raise ValueError('MFLOW_TTS_ENGINE은 mock 또는 sapi여야 합니다.')
+    if name == 'onecore':
+        return WindowsOneCore()
+    raise ValueError('MFLOW_TTS_ENGINE은 mock, sapi, onecore 중 하나여야 합니다.')
 
 
 def script_fingerprint(script: dict) -> str:

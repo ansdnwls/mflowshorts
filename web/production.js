@@ -98,6 +98,13 @@ function renderAnalysisWorkflow(p){
   $('#narration-status').textContent=narration?`${narration.mock?'모의 나레이션 · 무음 타이밍 시험':'나레이션 생성됨'} · ${narration.engine||''} · ${Number(narration.duration||0).toFixed(2)}초`:'나레이션을 생성하면 문장별 실제 파일 길이가 표시됩니다.';
   $('#narration-segments').innerHTML=narration?`<ol class="narration-timeline">${(narration.segments||[]).map(segment=>`<li><b>${Number(segment.start).toFixed(2)}–${Number(segment.end).toFixed(2)}초</b><span>${esc(segment.text||'')}</span><small>${esc(segment.scene_id||'')} · ${Number(segment.duration??segment.end-segment.start).toFixed(2)}초</small></li>`).join('')}</ol>`:'';
   const report=doc.qa_report;
+  const publication=doc.publish_approval;
+  const publishPanel=$('#publication-review');
+  publishPanel.hidden=p.status!=='completed'||!generated;
+  $('#publication-confirm').checked=false;
+  $('#publication-rights').value=publication?.rights_note||'';
+  $('#publication-approve').disabled=locked||!currentVoice||narration.mock!==false||report?.passed!==true||report?.audio_scope!=='rendered_mix'||!report?.output_sha256;
+  $('#publication-status').textContent=publication?'게시 준비 승인됨':$('#publication-approve').disabled?'실제 나레이션과 최종 영상 QA 통과가 필요합니다.':'최종 영상과 원본 사용 권한을 확인한 뒤 승인하세요.';
   $('#qa-result').innerHTML=report?`<p class="workflow-status ${report.passed?'qa-passed':'qa-warning'}">QA ${report.passed?'통과':'확인 필요'} · 자동 점검은 의미·발음의 최종 검토를 대신하지 않습니다.</p><pre class="qa-report">${esc(JSON.stringify(report,null,2))}</pre>`:'';
 }
 async function workflowAction(path,payload={},success='완료했습니다.'){
@@ -125,6 +132,13 @@ $('#analysis-confirm').onclick=async()=>{const analysis=readAnalysisEditor();try
 $('#script-generate').onclick=async()=>{if(analysisDirty){message('분석 수정사항을 먼저 저장하고 확정하세요.');return;}try{if(productionDirty)await saveProduction();await workflowAction('generate-script',{},'대본을 생성했습니다. 사실·추정과 장면을 검토한 뒤 승인하세요.');}catch(error){message(error.message);}};
 $('#narration-generate').onclick=()=>{if(productionDirty||analysisDirty){message('변경사항을 저장하고 대본을 다시 승인하세요.');return;}workflowAction('narration');};
 $('#production-qa').onclick=()=>{if(productionDirty||analysisDirty){message('변경사항을 저장한 뒤 QA를 실행하세요.');return;}workflowAction('qa',{},'QA 리포트를 확인하세요.');};
+$('#publication-approve').onclick=()=>{
+  if(productionDirty||analysisDirty){message('변경사항을 저장하고 최종 영상을 다시 렌더링하세요.');return;}
+  workflowAction('approve-publish',{
+    reviewed:$('#publication-confirm').checked,
+    rights_note:$('#publication-rights').value
+  },'게시 준비를 승인했습니다.');
+};
 $('#offset-reset').onclick=()=>{const form=$('#production-form');for(const k of OFFSETS)form.elements[k].value=0;form.dispatchEvent(new Event('input',{bubbles:true}));};
 
 // Blur boxes over text burned into the source. Coordinates are 0~1 of the 1080x1920 frame, same as the render.
