@@ -261,14 +261,61 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(output.read_bytes(),source.read_bytes())
     def test_unexpected_render_error_is_recoverable(self):
         self.add_source();production.update_project({'id':self.ident,'script':'대본'});production.approve(self.ident)
-        with patch.object(production,'state',return_value={'render_available':True}),patch.object(production.threading,'Thread') as thread:
+        with patch.object(production,'state',return_value={'render_available':True}):
             production.start_render(self.ident)
-        p=thread.call_args.kwargs['args'][0]
-        with patch.object(production,'STYLES',{}),patch('traceback.print_exc'):production.render(p)
+        with patch.object(production,'STYLES',{}),patch('traceback.print_exc'):production.process_next_render()
         self.assertEqual(production.project(self.ident)['status'],'error')
         self.assertFalse(production.LOCK.locked())
         self.assertEqual([x for x in (production.PROJECT_ROOT/self.ident).iterdir() if x.is_dir()],[])
         production.update_project({'id':self.ident,'script':'수정한 대본'})
+
+    def test_queue_deduplicates_and_claims_projects_in_order(self):
+        self.add_source()
+        production.update_project({'id':self.ident,'script':'대본'})
+        production.approve(self.ident)
+        other=production.create_project({'title':'두 번째','channel_id':self.channel})
+        with patch.object(production,'probe',return_value={'duration':20,'width':640,'height':480,'audio':False}):
+            production.upload(other,io.BytesIO(b'source'),6)
+        production.update_project({'id':other,'script':'두 번째 대본'})
+        production.approve(other)
+        with patch.object(production,'state',return_value={'render_available':True}):
+            first=production.start_render(self.ident)
+            self.assertEqual(production.start_render(self.ident)['job_id'],first['job_id'])
+            production.start_render(other)
+        calls=[]
+        def finish(project):
+            calls.append(project['id'])
+            project['status']='completed'
+            production.store(project)
+            production.LOCK.release()
+        with patch.object(production,'render',side_effect=finish):
+            self.assertTrue(production.process_next_render())
+            self.assertTrue(production.process_next_render())
+            self.assertFalse(production.process_next_render())
+        self.assertEqual(calls,[self.ident,other])
+        with app.connect() as con:
+            jobs=con.execute('SELECT status,attempts FROM production_render_jobs').fetchall()
+        self.assertEqual([tuple(job) for job in jobs],[('completed',1),('completed',1)])
+
+    def test_restart_requeues_interrupted_render_and_bounds_recovery(self):
+        self.add_source()
+        production.update_project({'id':self.ident,'script':'대본'})
+        production.approve(self.ident)
+        with patch.object(production,'state',return_value={'render_available':True}):
+            job=production.start_render(self.ident)
+            with app.connect() as con:
+                con.execute("UPDATE production_render_jobs SET status='running',attempts=1")
+            app.init()
+            production.recover_renders()
+            self.assertEqual(production.start_render(self.ident)['job_id'],job['job_id'])
+            self.assertEqual(production.start_render(self.ident)['status'],'queued')
+            with app.connect() as con:
+                con.execute("UPDATE production_render_jobs SET status='running',attempts=?", (production.MAX_RENDER_ATTEMPTS,))
+            production.recover_renders()
+            self.assertEqual(production.project(self.ident)['status'],'error')
+            retry=production.start_render(self.ident)
+            self.assertNotEqual(retry['job_id'],job['job_id'])
+            self.assertEqual(retry['status'],'queued')
     def test_headline_must_fit_three_lines(self):
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'headline':'가'*55})
         production.update_project({'id':self.ident,'headline':'가'*54})

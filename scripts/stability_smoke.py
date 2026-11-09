@@ -76,7 +76,9 @@ def color_at(path, at, width, height):
 
 
 def wait_render(production, ident, timeout=120):
-    production.start_render(ident)
+    job=production.start_render(ident)
+    check(production.start_render(ident)['job_id']==job['job_id'], 'Duplicate request created a job')
+    production.process_next_render()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         project = production.project(ident)

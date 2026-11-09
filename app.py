@@ -447,7 +447,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/production/approve':
                 production.approve(str(data.get('id','')));return self.send_json({'message':'현재 대본과 스타일을 승인했습니다.'})
             if self.path == '/api/production/render':
-                production.start_render(str(data.get('id','')));return self.send_json({'message':'렌더링을 시작했습니다.'},202)
+                result = production.start_render(str(data.get('id','')))
+                return self.send_json(result, 200 if result['status']=='completed' else 202)
             if self.path == '/api/media/jobs': return self.send_json({'job_id':start_media_job(data)},202)
             if self.path == '/api/scan': return self.send_json({'message':scan()})
             if self.path == '/api/bookmarks':
@@ -494,13 +495,34 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc: self.fail(exc)
 
 def main():
-    init()
-    with connect() as con:
-        con.execute("UPDATE production_projects SET status='error' WHERE status='rendering'")
-        con.execute("UPDATE media_jobs SET status='error',code='interrupted',message='서버가 재시작되어 작업이 중단되었습니다. 다시 시도하세요.' WHERE status IN ('queued','running')")
-    threading.Thread(target=scheduler,daemon=True).start()
-    server = ThreadingHTTPServer(('127.0.0.1',int(os.environ.get('PORT','8020'))),Handler)
-    print('mflowshorts server ready',flush=True)
-    server.serve_forever()
+    with ThreadingHTTPServer(('127.0.0.1',int(os.environ.get('PORT','8020'))),Handler) as server:
+        DB.parent.mkdir(parents=True, exist_ok=True)
+        # Hold the OS lock for the server lifetime. A crash releases it automatically.
+        with DB.resolve().with_suffix(DB.suffix+'.server-lock').open('a+b') as owner:
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    owner.seek(0)
+                    msvcrt.locking(owner.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise SystemExit('같은 데이터베이스를 사용하는 앱이 이미 실행 중입니다.') from None
+            init()
+            production.recover_renders()
+            with connect() as con:
+                con.execute("UPDATE media_jobs SET status='error',code='interrupted',message='서버가 재시작되어 작업이 중단되었습니다. 다시 시도하세요.' WHERE status IN ('queued','running')")
+            threading.Thread(target=scheduler,daemon=True).start()
+            stop = threading.Event()
+            worker = threading.Thread(target=production.render_worker,args=(stop,),daemon=True)
+            worker.start()
+            print('mflowshorts server ready',flush=True)
+            try:
+                server.serve_forever()
+            finally:
+                stop.set()
+                production.RENDER_WAKE.set()
+                worker.join()
 
 if __name__ == '__main__': main()

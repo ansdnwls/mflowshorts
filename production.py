@@ -45,6 +45,8 @@ STYLES = {'basic':{'name':'기본 스타일','title':'#ffe34a','title2':'#ff5a5a
 LOCK = threading.Lock()
 CONNECT = None
 CONFIG_LOCK = threading.RLock()
+RENDER_WAKE = threading.Event()
+MAX_RENDER_ATTEMPTS = 3
 
 def serialized(function):
     @functools.wraps(function)
@@ -59,7 +61,11 @@ def init(connect):
     CONNECT = connect
     with CONNECT() as con:
         con.executescript('''CREATE TABLE IF NOT EXISTS production_channels (id TEXT PRIMARY KEY,name TEXT,language TEXT,template TEXT,created_at TEXT);
-        CREATE TABLE IF NOT EXISTS production_projects (id TEXT PRIMARY KEY,title TEXT,channel_id TEXT,status TEXT,document TEXT,created_at TEXT,updated_at TEXT);''')
+        CREATE TABLE IF NOT EXISTS production_projects (id TEXT PRIMARY KEY,title TEXT,channel_id TEXT,status TEXT,document TEXT,created_at TEXT,updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS production_render_jobs (
+            project_id TEXT PRIMARY KEY, id TEXT NOT NULL, status TEXT NOT NULL,
+            attempts INTEGER NOT NULL, created_at TEXT NOT NULL
+        );''')
 
 
 def state():
@@ -89,8 +95,14 @@ def project(project_id):
     p=dict(row);p['document']=json.loads(p['document']);return p
 
 
-def store(p):
-    with CONNECT() as con: con.execute('UPDATE production_projects SET title=?,channel_id=?,status=?,document=?,updated_at=? WHERE id=?',(p['title'],p['channel_id'],p['status'],json.dumps(p['document'],ensure_ascii=False),now(),p['id']))
+def store(p, con=None):
+    if con is None:
+        with CONNECT() as connection:
+            return store(p, connection)
+    con.execute('UPDATE production_projects SET title=?,channel_id=?,status=?,document=?,updated_at=? WHERE id=?',(p['title'],p['channel_id'],p['status'],json.dumps(p['document'],ensure_ascii=False),now(),p['id']))
+    if p.get('render_job_id') and p['status'] in ('completed', 'error'):
+        con.execute('UPDATE production_render_jobs SET status=? WHERE project_id=? AND id=?',
+                    (p['status'], p['id'], p['render_job_id']))
 
 
 def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'band','title_font':'','caption_font':'',**{k:0 for k in OFFSETS}}
@@ -562,6 +574,11 @@ def approve(project_id):
 @serialized
 def start_render(project_id):
     p=project(project_id);doc=p['document']
+    if p['status']=='rendering':
+        with CONNECT() as con:
+            job=con.execute("SELECT id,status FROM production_render_jobs WHERE project_id=? AND status IN ('queued','running')",(project_id,)).fetchone()
+        if job:
+            return {'job_id':job['id'],'status':job['status'],'message':doc['message']}
     if p['status'] not in ('approved','completed','error') or not doc.get('approved_hash') or doc['approved_hash']!=fingerprint(doc):raise ValueError('현재 대본과 설정을 먼저 승인하세요.')
     if not state()['render_available']:raise ValueError('FFmpeg/FFprobe와 한국어 글꼴 설치가 필요합니다.')
     if doc.get('generated_script'):
@@ -569,9 +586,83 @@ def start_render(project_id):
         workflow.current_script(doc)
         if not doc.get('narration') or doc['narration'].get('approved_hash') != doc['approved_hash']:
             raise ValueError('현재 승인된 대본의 나레이션을 먼저 생성하세요.')
-    if not LOCK.acquire(blocking=False):raise ValueError('다른 영상이 렌더링 중입니다. 완료 후 다시 시도하세요.')
-    p['status']='rendering';doc['message']='세로 영상과 제목·대본 자막을 렌더링하고 있습니다.';store(p)
-    threading.Thread(target=render,args=(p,),daemon=True).start()
+    if p['status']=='completed':
+        try:
+            for kind in ('output','archive'):
+                if not asset(project_id,kind).stat().st_size:
+                    raise ValueError('empty render asset')
+        except (OSError,ValueError):
+            pass
+        else:
+            return {'status':'completed','message':'같은 설정으로 완료된 영상을 사용할 수 있습니다.'}
+    job_id=uuid.uuid4().hex
+    p['status']='rendering'
+    doc['message']='렌더 대기열에 등록했습니다.'
+    with CONNECT() as con:
+        con.execute("INSERT OR REPLACE INTO production_render_jobs VALUES (?,?,'queued',0,?)",
+                    (project_id,job_id,now()))
+        store(p,con)
+    RENDER_WAKE.set()
+    return {'job_id':job_id,'status':'queued','message':doc['message']}
+
+
+@serialized
+def recover_renders():
+    """Restore persisted jobs on startup, before starting the worker."""
+    with CONNECT() as con:
+        rows=con.execute("""SELECT p.*, j.id AS render_job_id, j.attempts
+            FROM production_projects p LEFT JOIN production_render_jobs j
+            ON j.project_id=p.id AND j.status IN ('queued','running')
+            WHERE p.status='rendering'""").fetchall()
+        for row in rows:
+            p=dict(row)
+            p['document']=json.loads(p['document'])
+            if p['render_job_id'] and p['attempts'] < MAX_RENDER_ATTEMPTS:
+                con.execute("UPDATE production_render_jobs SET status='queued' WHERE id=?",(p['render_job_id'],))
+                p['document']['message']='앱이 다시 시작되어 렌더 대기열을 복구했습니다.'
+            else:
+                p['status']='error'
+                p['document']['message']='렌더가 중단되었습니다. 다시 시도하세요.'
+            store(p,con)
+
+
+def process_next_render():
+    """Claim one queued render and finish it before taking the next."""
+    if not LOCK.acquire(blocking=False):
+        return False
+    handed_off=False
+    try:
+        with CONFIG_LOCK, CONNECT() as con:
+            con.execute('BEGIN IMMEDIATE')
+            row=con.execute("""SELECT p.*, j.id AS render_job_id
+                FROM production_render_jobs j JOIN production_projects p ON p.id=j.project_id
+                WHERE j.status='queued' AND p.status='rendering'
+                ORDER BY j.created_at,j.id LIMIT 1""").fetchone()
+            if not row:
+                return False
+            p=dict(row)
+            p['document']=json.loads(p['document'])
+            con.execute("UPDATE production_render_jobs SET status='running',attempts=attempts+1 WHERE id=?",
+                        (p['render_job_id'],))
+            p['document']['message']='세로 영상과 자막을 렌더링하고 있습니다.'
+            store(p,con)
+        handed_off=True
+        render(p)
+        return True
+    finally:
+        if not handed_off:
+            LOCK.release()
+
+
+def render_worker(stop):
+    while not stop.is_set():
+        try:
+            if process_next_render():
+                continue
+        except Exception:
+            traceback.print_exc()
+        RENDER_WAKE.wait(1)
+        RENDER_WAKE.clear()
 
 
 def filter_path(path):
