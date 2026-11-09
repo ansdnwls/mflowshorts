@@ -1,10 +1,18 @@
 # mflowshorts
 
+## 분석·나레이션 제작
+
+원본 업로드 → 분석 양식 생성 → 장면별 사실·추정 수정 → 분석 확정 → 대본 생성 → 대본 승인 → 나레이션 생성 → QA → 렌더 순서로 진행합니다. 분석이나 원본을 바꾸면 후속 승인을 다시 받아야 합니다.
+
+기본 분석·대본은 모의 제공자이며, 기본 음성은 타이밍 검증용 무음입니다. Windows에 한국어 SAPI 음성이 설치되어 있으면 PowerShell에서 `$env:MFLOW_TTS_ENGINE='sapi'`를 설정하고 앱을 시작하세요. 기본 접속 주소는 `http://127.0.0.1:8020`입니다.
+
+검증은 `python -m unittest discover -s tests -v`로 실행합니다. 실제 FFmpeg 제작 검증은 `python scripts/stability_smoke.py`로 실행하며 사용자 프로젝트와 분리된 테스트 영상을 사용합니다.
+
 해외 바이럴 영상의 출처 후보를 찾고, 아침 10분 동안 검토하기 위한 초기 개발 버전입니다.
 
 ## 실행
 
-Python 3.12 이상. 기본 YouTube 앱은 표준 라이브러리로 실행합니다. Douyin·TikTok 연동은 아래 미디어 도구 설치 절차가 필요합니다.
+Python 3.11 이상. 기본 YouTube 앱은 표준 라이브러리로 실행합니다. Douyin·TikTok 연동은 아래 미디어 도구 설치 절차가 필요합니다.
 
 ```bash
 cd /workspace/mflowshorts
@@ -18,11 +26,11 @@ python3 app.py
 ```bat
 scripts\install_windows.cmd -CheckOnly   :: 설치 없이 상태만 확인
 scripts\install_windows.cmd              :: 없는 항목 설치 후 다시 확인
-set PORT=8010
+set PORT=8020
 python app.py
 ```
 
-스크립트는 Python 3.12+, Git, FFmpeg·ffprobe, 맑은 고딕 Bold(`C:\Windows\Fonts\malgunbd.ttf`), 미디어 가상환경(`data\media-venv`, `requirements-media.lock` 고정 버전), douyin-downloader 고정 커밋, Playwright Chromium을 확인합니다. 없는 프로그램은 winget으로 설치하고, 마지막에 앱과 같은 글꼴·FFmpeg 필터로 한글 제목 영상을 실제로 만들어 봅니다. 기존 `data\` 내용은 지우거나 덮어쓰지 않습니다. `-SkipMedia`를 붙이면 Douyin·TikTok 도구 설치를 건너뜁니다. 새로 설치한 프로그램이 있으면 새 터미널 창에서 앱을 실행하세요. Windows의 TikTok 검색은 `CHROMIUM_PATH`가 없으면 Playwright가 내려받은 Chromium을 사용합니다.
+스크립트는 Python 3.11+, Git, FFmpeg·ffprobe, 맑은 고딕 Bold(`C:\Windows\Fonts\malgunbd.ttf`), 미디어 가상환경(`data\media-venv`, `requirements-media.lock` 고정 버전), douyin-downloader 고정 커밋, Playwright Chromium을 확인합니다. 없는 프로그램은 winget으로 설치하고, 마지막에 앱과 같은 글꼴·FFmpeg 필터로 한글 제목 영상을 실제로 만들어 봅니다. 기존 `data\` 내용은 지우거나 덮어쓰지 않습니다. `-SkipMedia`를 붙이면 Douyin·TikTok 도구 설치를 건너뜁니다. 새로 설치한 프로그램이 있으면 새 터미널 창에서 앱을 실행하세요. Windows의 TikTok 검색은 `CHROMIUM_PATH`가 없으면 Playwright가 내려받은 Chromium을 사용합니다.
 
 #### AI 자막 지우기 (NVIDIA 그래픽카드, 선택)
 
@@ -33,7 +41,7 @@ scripts\install_ai_eraser.cmd              :: 그래픽카드에 맞는 패키�
 
 원본 글자 가리기의 "AI 자막 지우기 (NVIDIA)" 모드는 [video-subtitle-remover](https://github.com/YaoFANGUK/video-subtitle-remover)(Apache-2.0)의 Windows 실행 패키지를 씁니다. 스크립트는 `nvidia-smi`로 그래픽카드 세대와 드라이버 버전을 읽어 CUDA 11.8 / 12.6 / 12.8 패키지 중 하나를 고릅니다. 패키지에는 Python·PyTorch·PaddleOCR이 들어 있어 용량이 수 GB이고, PC의 Python은 건드리지 않습니다. 이 도구의 문자 인식은 한글 경로의 모델 파일을 읽지 못하기 때문에, 프로젝트 경로에 한글이 있으면 `%LOCALAPPDATA%\mflowshorts\vsr`에 설치합니다. 설치 위치는 `data\vsr-path.txt`에 적힙니다. 자동으로 받을 수 없으면 릴리스 페이지에서 직접 받은 뒤 `-Archive 파일경로`로 설치하세요. 렌더할 때는 박스 안에서 자막이 보이는 프레임만 찾아(OCR) STTN으로 다시 그립니다. 처리 기록은 렌더 폴더의 `ai_eraser.log`에 남습니다.
 
-로컬 포트 기본값은 8000이며 `PORT`로 변경할 수 있습니다. 서버는 기본적으로 루프백에만 바인딩합니다. 사용자 인증이 없는 개인 개발용입니다.
+로컬 포트 기본값은 8020이며 `PORT`로 변경할 수 있습니다. 서버는 기본적으로 루프백에만 바인딩합니다. 사용자 인증이 없는 개인 개발용입니다.
 
 ## 가능한 작업
 

@@ -228,14 +228,10 @@ def update_project(data):
         from urllib.parse import urlsplit
         u=urlsplit(source_url)
         if u.scheme!='https' or not u.hostname or u.username or u.password:raise ValueError('출처는 HTTPS 링크로 입력하세요.')
-<<<<<<< HEAD
     if script != doc['script']:
         doc.pop('narration',None)
     doc.pop('qa_report',None)
-    p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'comments':cards,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
-=======
     p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'credit_on':bool(data.get('credit_on',doc.get('credit_on',True))),'comments':cards,'blurs':boxes,'cues':timeline,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
->>>>>>> 48d170d85a7c8d1866ab63fa8562473e23c0d6ef
     doc.pop('output',None);doc.pop('archive',None)
     p['status']='script_ready' if script and doc['source'] else 'source_ready' if doc['source'] else 'draft'
     doc['message']='대본과 설정을 검토한 뒤 승인하세요.' if p['status']=='script_ready' else '원본과 대본을 준비하세요.'
@@ -290,13 +286,9 @@ def save_source(project_id,path,info):
 def fingerprint(doc):
     # credit/comments only count when set, so projects approved before they existed stay approved.
     data={k:doc.get(k) for k in ('source','script','headline','settings')}
-<<<<<<< HEAD
-    data.update({k:doc[k] for k in ('credit','comments') if doc.get(k)})
     data.update({k:doc[k] for k in ('analysis','generated_script') if doc.get(k)})
-=======
     data.update({k:doc[k] for k in ('credit','comments','blurs','cues') if doc.get(k)})
     if doc.get('credit_on') is False:data['credit_on']=False
->>>>>>> 48d170d85a7c8d1866ab63fa8562473e23c0d6ef
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 
@@ -325,7 +317,7 @@ PRE_MODES=('text','ai')  # handled outside FFmpeg, before the blur graph
 FEATHER=px(11)  # soft edge so the box outline does not show
 
 
-def blur_graph(chain,boxes,duration):
+def blur_graph(chain,boxes,duration,prefix=''):
     """Filter graph that hides each box on the laid-out frame, before the title and captions are drawn on top.
 
     erase: delogo fills the box from the pixels around it, so the text looks gone rather than smudged.
@@ -345,7 +337,9 @@ def blur_graph(chain,boxes,duration):
         mask=f"geq=lum='255*min(1,min(min(X,W-1-X),min(Y,H-1-Y))/{FEATHER})':cb=128:cr=128"
         on=f"between(t,{box['start']},{box['end'] or duration+1})"
         graph.append(f"[v{i}]split[m{i}][s{i}];[s{i}]crop={cw}:{ch}:{cx}:{cy},split[k{i}][q{i}];[q{i}]{mask}[a{i}];[k{i}]{hide}[h{i}];[h{i}][a{i}]alphamerge[f{i}];[m{i}][f{i}]overlay={cx}:{cy}:enable='{on}'[v{i+1}]")
-    return ';'.join(graph)+f';[v{len(boxes)}]null'
+    result=';'.join(graph)+f';[v{len(boxes)}]null'
+    # A narration graph already owns v0/a0 labels. Keep overlay branches distinct.
+    return re.sub(r'\[([a-z]+\d+)\]',lambda match:'['+prefix+match[1]+']',result) if prefix else result
 
 
 class ToolError(ValueError):
@@ -700,10 +694,14 @@ def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layo
          f'Style: CommentName,{ui_family},{COMMENT_NAME_FONT},&H00707070&,&H000000FF&,&H00000000&,&H00000000&,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
          f'Style: Comment,{ui_family},{COMMENT_FONT},&H00141414&,&H000000FF&,&H00000000&,&H00000000&,{ui_bold},0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
          '','[Events]','Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
-<<<<<<< HEAD
-         f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{title_bottom})}}{title}']
-    if credit:ass.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Credit,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT-px(12)})}}{ass_text(credit)}')
-    ass.extend(comment_events(doc.get('comments') or [],layout,duration))
+         f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{title_bottom+shift["title_y"]})}}{title}']
+    if credit:ass.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Credit,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT-px(12)+shift["credit_y"]})}}{ass_text(credit)}')
+    ass.extend(comment_events(doc.get('comments') or [],layout,duration,shift['comment_y']))
+    # Explicit timeline edits take precedence over automatic sentence captions.
+    if doc.get('cues'):
+        events,srt=cue_events(doc['cues'],style,layout,duration,shift['caption_y'])
+        if captions:ass.extend(events)
+        return '\n'.join(ass)+'\n',srt
     srt=[];events=[]
     if doc.get('narration'):
         for segment in doc['narration']['segments']:
@@ -716,18 +714,6 @@ def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layo
         chunks=caption_chunks(doc['script'])
         events=[(duration*index/len(chunks),duration*(index+1)/len(chunks),chunk) for index,chunk in enumerate(chunks)]
     for index,(start,end,chunk) in enumerate(events):
-=======
-         f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{title_bottom+shift["title_y"]})}}{title}']
-    if credit:ass.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Credit,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT-px(12)+shift["credit_y"]})}}{ass_text(credit)}')
-    ass.extend(comment_events(doc.get('comments') or [],layout,duration,shift['comment_y']))
-    if doc.get('cues'):
-        events,srt=cue_events(doc['cues'],style,layout,duration,shift['caption_y'])
-        if captions:ass.extend(events)
-        return '\n'.join(ass)+'\n',srt
-    srt=[];chunks=caption_chunks(doc['script'])
-    for index,chunk in enumerate(chunks):
-        start=duration*index/len(chunks);end=duration*(index+1)/len(chunks)
->>>>>>> 48d170d85a7c8d1866ab63fa8562473e23c0d6ef
         srt.extend([str(index+1),f'{srt_time(start)} --> {srt_time(end)}','\n'.join(' '.join(w for w,_ in line) for line in chunk),''])
         text=r'\N'.join(' '.join(('{\\c'+ass_color(style['highlight'])+'}'+ass_text(w)+'{\\c'+ass_color(style['caption'])+'}') if marked else ass_text(w) for w,marked in line) for line in chunk)
         if captions:ass.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{{\\pos({WIDTH//2},{CAPTION_BOTTOM.get(layout,CAPTION_BOTTOM["band"])+shift["caption_y"]})}}{text}')
@@ -754,6 +740,16 @@ def narration_qa_data(doc, plan):
             start=segment['start']+segment['duration']*index/len(chunks)
             end=segment['start']+segment['duration']*(index+1)/len(chunks)
             voice['captions'].append({'sentence_id':segment['sentence_id'],'text':'\n'.join(' '.join(w for w,_ in line) for line in chunk),'start':start,'end':end})
+    if doc.get('cues'):
+        voice['captions']=[]
+        duration=doc['narration']['duration'];items=doc['cues']
+        for index,cue in enumerate(items):
+            start=min(cue['start'],duration)
+            end=min(cue['end'] or (items[index+1]['start'] if index+1<len(items) else duration),duration)
+            if end<=start:continue
+            text='\n'.join(' '.join(word for word,_ in line) for line in cue_lines(cue['text']))
+            if cue['sub']:text+='\n'+cue['sub']
+            voice['captions'].append({'text':text,'start':start,'end':end})
     return voice
 
 
@@ -775,12 +771,31 @@ def render(p):
         if cfg['mirror']:vf.append('hflip')
         boxes=doc.get('blurs') or [];letters=[b for b in boxes if b.get('mode')=='text'];ai=[b for b in boxes if b.get('mode')=='ai']
         source_args=['-ss',str(cfg['start']),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source)]
+        graph=None
+        if voice:
+            graph=editing.ffmpeg_filters(plan,doc['source'].get('audio',False),cfg['mute'])
+            voice_args=['-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source),
+                        '-protocol_whitelist','file','-i',str(asset(p['id'],'narration'))]
         if ai or letters:
             # These erasers work on the laid-out video outside FFmpeg; their result replaces the source picture.
             picture=None
+            if voice:
+                # Match scenes before erasing: box coordinates/times refer to the final
+                # canvas and spoken timeline, not a contiguous slice of the source.
+                laid=run/'matched-laid.mp4'
+                filters=graph['filters']+[f'[{graph["video_label"]}]'+','.join(vf)+'[laid_video]']
+                subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y',*voice_args,
+                                '-filter_complex_threads','2','-filter_complex',';'.join(filters),'-t',str(duration),
+                                '-map','[laid_video]','-map',f'[{graph["audio_label"]}]',
+                                '-c:v','libx264','-preset','veryfast','-crf','14','-pix_fmt','yuv420p',
+                                '-c:a','aac','-b:a','192k',str(laid)],capture_output=True,timeout=900,check=True)
+                picture=laid
+                source_args=['-i',str(laid)]  # Preserve its scene-matched, ducked audio.
             if ai:
-                laid=run/'laid.mp4'
-                subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y',*source_args,'-t',str(duration),'-map','0:v:0','-an','-vf',','.join(vf+['fps=30']) ,'-c:v','libx264','-preset','veryfast','-crf','14','-pix_fmt','yuv420p',str(laid)],capture_output=True,timeout=900,check=True)
+                if picture is None:
+                    laid=run/'laid.mp4'
+                    subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y',*source_args,'-t',str(duration),'-map','0:v:0','-an','-vf',','.join(vf+['fps=30']) ,'-c:v','libx264','-preset','veryfast','-crf','14','-pix_fmt','yuv420p',str(laid)],capture_output=True,timeout=900,check=True)
+                else:laid=picture
                 picture=run/'ai.mp4';erase_ai(laid,picture,ai,run/'ai_eraser.log')
             if letters:
                 cleaned=run/'cleaned.mp4'
@@ -788,7 +803,7 @@ def render(p):
                 else:erase_letters({'mode':'video','source':str(source),'start':cfg['start'],'duration':duration,'chain':','.join(vf),'boxes':letters,'output':str(cleaned)})
                 picture=cleaned
             vf=[];source_args=['-i',str(picture)]+source_args
-        vf=[blur_graph(','.join(vf) or 'null',[b for b in boxes if b.get('mode') not in PRE_MODES],duration)]
+        vf=[blur_graph(','.join(vf) or 'null',[b for b in boxes if b.get('mode') not in PRE_MODES],duration,prefix='overlay_')]
         # libass loads the font from its own folder, so it does not depend on the system font setup (fontconfig on Windows).
         title_font=font_path(cfg.get('title_font',''));caption_font=font_path(cfg.get('caption_font',''))
         fonts=run/'fonts';fonts.mkdir()
@@ -798,20 +813,19 @@ def render(p):
         vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"ass=filename={filter_path(run/'overlay.ass')}:fontsdir={filter_path(fonts)}"])
         (run/'captions.srt').write_text(srt,encoding='utf-8')
         output=run/'short.mp4'
-<<<<<<< HEAD
-        if voice:
-            graph=editing.ffmpeg_filters(plan,doc['source'].get('audio',False),cfg['mute'])
+        if voice and not (ai or letters):
             filters=graph['filters']+[f'[{graph["video_label"]}]'+','.join(vf)+'[finished_video]']
-            command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2','-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source),'-protocol_whitelist','file','-i',str(asset(p['id'],'narration')),'-filter_complex_threads','2','-filter_complex',';'.join(filters),'-t',str(duration),'-map','[finished_video]','-map',f'[{graph["audio_label"]}]']
+            command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*voice_args,'-filter_complex_threads','2','-filter_complex',';'.join(filters),'-t',str(duration),'-map','[finished_video]','-map',f'[{graph["audio_label"]}]']
         else:
-            command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-ss',str(cfg['start']),'-threads','2','-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source),'-t',str(duration),'-map','0:v:0']
-            if not cfg['mute']:command+=['-map','0:a:0?']
+            audio=1 if letters or ai else 0
+            command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args,'-t',str(duration),'-map','0:v:0']
+            if voice or not cfg['mute']:command+=['-map',f'{audio}:a:0?']
             command+=['-vf',','.join(vf)]
         command+=['-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
         subprocess.run(command,capture_output=True,timeout=480,check=True)
         result=probe(output)
         if result['width']!=WIDTH or result['height']!=HEIGHT:raise ValueError('render size')
-        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','approved_hash':doc['approved_hash']}
+        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'manual timeline' if doc.get('cues') else 'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','blurs':doc.get('blurs') or [],'cues':doc.get('cues') or [],'credit':doc.get('credit',''),'credit_on':doc.get('credit_on',True),'approved_hash':doc['approved_hash']}
         archive_files=['short.mp4','captions.srt','project.json']
         if voice:
             import qa
@@ -820,20 +834,10 @@ def render(p):
             report=qa.check_report(doc['analysis'],{**script,'approved':True},narration_qa_data(doc,plan),mixed_audio)
             report['audio_scope']='rendered_mix'
             doc['qa_report']=report
-            manifest.update(version=2,analysis=doc['analysis'],generated_script=script,narration=voice,edit_plan=plan,caption_timing='measured sentence WAV duration; chunks within sentence',qa_report=report)
+            manifest.update(version=2,analysis=doc['analysis'],generated_script=script,narration=voice,edit_plan=plan,caption_timing='manual timeline' if doc.get('cues') else 'measured sentence WAV duration; chunks within sentence',qa_report=report)
             (run/'qa-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
             archive_files.append('qa-report.json')
             mixed_audio.unlink()
-=======
-        audio=1 if letters or ai else 0
-        command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args,'-t',str(duration),'-map','0:v:0']
-        if not cfg['mute']:command+=['-map',f'{audio}:a:0?']
-        command+=['-vf',','.join(vf),'-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
-        subprocess.run(command,capture_output=True,timeout=480,check=True)
-        result=probe(output)
-        if result['width']!=WIDTH or result['height']!=HEIGHT:raise ValueError('render size')
-        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'manual timeline' if doc.get('cues') else 'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','blurs':doc.get('blurs') or [],'approved_hash':doc['approved_hash']}
->>>>>>> 48d170d85a7c8d1866ab63fa8562473e23c0d6ef
         (run/'project.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
         with zipfile.ZipFile(run/'project.zip','w',compression=zipfile.ZIP_STORED) as archive:
             for name in archive_files:archive.write(run/name,name)
