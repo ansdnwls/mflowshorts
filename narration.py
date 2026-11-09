@@ -87,8 +87,8 @@ try {
                 raise ValueError('Windows 한국어 SAPI 음성이 필요합니다. 한국어 음성 설치 상태를 확인하세요.')
 
 
-def configured_engine() -> TTSEngine:
-    name = os.environ.get('MFLOW_TTS_ENGINE', 'mock').strip().lower()
+def configured_engine(name=None) -> TTSEngine:
+    name = (name if name is not None else os.environ.get('MFLOW_TTS_ENGINE', 'mock')).strip().lower()
     if name == 'mock':
         return MockTTS()
     if name == 'sapi':

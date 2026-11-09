@@ -104,7 +104,11 @@ def run_case(production, workflow, narration, channel, name, source, generated, 
         workflow.confirm_analysis(ident)
         workflow.generate_script(ident)
         production.approve(ident)
-        voice = workflow.generate_narration(ident, narration.MockTTS())['narration']
+        from unittest.mock import patch
+        with patch.dict('os.environ', {'MFLOW_TTS_ENGINE': 'mock'}):
+            check(workflow.queue_narration(ident)['status']=='queued', 'Narration not queued')
+            check(production.process_next_render(), 'Narration queue did not run')
+            voice = workflow.queue_narration(ident)['narration']
         check(voice['mock'] is True, 'Smoke must not pretend mock silence is speech')
     else:
         production.update_project({'id': ident, 'script': '직접 작성한 자막입니다.',

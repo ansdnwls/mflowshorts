@@ -66,6 +66,9 @@ def init(connect):
             project_id TEXT PRIMARY KEY, id TEXT NOT NULL, status TEXT NOT NULL,
             attempts INTEGER NOT NULL, created_at TEXT NOT NULL
         );''')
+        columns={row['name'] for row in con.execute('PRAGMA table_info(production_render_jobs)')}
+        if 'engine' not in columns:
+            con.execute('ALTER TABLE production_render_jobs ADD COLUMN engine TEXT')
 
 
 def state():
@@ -97,12 +100,13 @@ def project(project_id):
 
 def store(p, con=None):
     if con is None:
-        with CONNECT() as connection:
+        with CONFIG_LOCK, CONNECT() as connection:
             return store(p, connection)
     con.execute('UPDATE production_projects SET title=?,channel_id=?,status=?,document=?,updated_at=? WHERE id=?',(p['title'],p['channel_id'],p['status'],json.dumps(p['document'],ensure_ascii=False),now(),p['id']))
-    if p.get('render_job_id') and p['status'] in ('completed', 'error'):
+    if p.get('render_job_id') and p['status'] in ('approved', 'completed', 'error'):
+        job_status='completed' if p['status']=='approved' else p['status']
         con.execute('UPDATE production_render_jobs SET status=? WHERE project_id=? AND id=?',
-                    (p['status'], p['id'], p['render_job_id']))
+                    (job_status, p['id'], p['render_job_id']))
 
 
 def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'band','title_font':'','caption_font':'',**{k:0 for k in OFFSETS}}
@@ -574,11 +578,9 @@ def approve(project_id):
 @serialized
 def start_render(project_id):
     p=project(project_id);doc=p['document']
-    if p['status']=='rendering':
-        with CONNECT() as con:
-            job=con.execute("SELECT id,status FROM production_render_jobs WHERE project_id=? AND status IN ('queued','running')",(project_id,)).fetchone()
-        if job:
-            return {'job_id':job['id'],'status':job['status'],'message':doc['message']}
+    existing=active_job(p)
+    if existing:
+        return existing
     if p['status'] not in ('approved','completed','error') or not doc.get('approved_hash') or doc['approved_hash']!=fingerprint(doc):raise ValueError('현재 대본과 설정을 먼저 승인하세요.')
     if not state()['render_available']:raise ValueError('FFmpeg/FFprobe와 한국어 글꼴 설치가 필요합니다.')
     if doc.get('generated_script'):
@@ -595,15 +597,33 @@ def start_render(project_id):
             pass
         else:
             return {'status':'completed','message':'같은 설정으로 완료된 영상을 사용할 수 있습니다.'}
+    return enqueue_job(p)
+
+
+def active_job(p, *, voice=False):
+    if p['status']!='rendering':
+        return None
+    with CONNECT() as con:
+        job=con.execute("SELECT id,status,engine FROM production_render_jobs WHERE project_id=? AND status IN ('queued','running')",(p['id'],)).fetchone()
+    if job:
+        if bool(job['engine']) != voice:
+            raise ValueError('이 프로젝트의 다른 제작 작업이 진행 중입니다.')
+        return {'job_id':job['id'],'status':job['status'],'message':p['document']['message']}
+
+
+def enqueue_job(p, engine=None):
+    """Register a validated job while the caller holds CONFIG_LOCK."""
     job_id=uuid.uuid4().hex
     p['status']='rendering'
-    doc['message']='렌더 대기열에 등록했습니다.'
+    message='나레이션 대기열에 등록했습니다.' if engine else '렌더 대기열에 등록했습니다.'
+    p['document']['message']=message
     with CONNECT() as con:
-        con.execute("INSERT OR REPLACE INTO production_render_jobs VALUES (?,?,'queued',0,?)",
-                    (project_id,job_id,now()))
+        con.execute("""INSERT OR REPLACE INTO production_render_jobs
+            (project_id,id,status,attempts,created_at,engine) VALUES (?,?,'queued',0,?,?)""",
+                    (p['id'],job_id,now(),engine))
         store(p,con)
     RENDER_WAKE.set()
-    return {'job_id':job_id,'status':'queued','message':doc['message']}
+    return {'job_id':job_id,'status':'queued','message':message}
 
 
 @serialized
@@ -619,10 +639,10 @@ def recover_renders():
             p['document']=json.loads(p['document'])
             if p['render_job_id'] and p['attempts'] < MAX_RENDER_ATTEMPTS:
                 con.execute("UPDATE production_render_jobs SET status='queued' WHERE id=?",(p['render_job_id'],))
-                p['document']['message']='앱이 다시 시작되어 렌더 대기열을 복구했습니다.'
+                p['document']['message']='앱이 다시 시작되어 제작 대기열을 복구했습니다.'
             else:
                 p['status']='error'
-                p['document']['message']='렌더가 중단되었습니다. 다시 시도하세요.'
+                p['document']['message']='제작 작업이 중단되었습니다. 다시 시도하세요.'
             store(p,con)
 
 
@@ -634,7 +654,7 @@ def process_next_render():
     try:
         with CONFIG_LOCK, CONNECT() as con:
             con.execute('BEGIN IMMEDIATE')
-            row=con.execute("""SELECT p.*, j.id AS render_job_id
+            row=con.execute("""SELECT p.*, j.id AS render_job_id, j.engine AS job_engine
                 FROM production_render_jobs j JOIN production_projects p ON p.id=j.project_id
                 WHERE j.status='queued' AND p.status='rendering'
                 ORDER BY j.created_at,j.id LIMIT 1""").fetchone()
@@ -644,8 +664,12 @@ def process_next_render():
             p['document']=json.loads(p['document'])
             con.execute("UPDATE production_render_jobs SET status='running',attempts=attempts+1 WHERE id=?",
                         (p['render_job_id'],))
-            p['document']['message']='세로 영상과 자막을 렌더링하고 있습니다.'
+            p['document']['message']='나레이션을 생성하고 있습니다.' if p['job_engine'] else '세로 영상과 자막을 렌더링하고 있습니다.'
             store(p,con)
+        if p['job_engine']:
+            import workflow
+            workflow.run_narration_job(p)
+            return True
         handed_off=True
         render(p)
         return True

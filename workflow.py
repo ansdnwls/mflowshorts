@@ -1,5 +1,8 @@
 """Persist the reviewed analysis -> approved script -> narration workflow."""
+import hashlib
 import json
+import os
+import traceback
 import uuid
 
 import analysis_script
@@ -83,16 +86,67 @@ def generate_script(project_id, provider=None):
 
 @production.serialized
 def generate_narration(project_id, engine=None):
-    import narration
-    import editing
-    p = editable(project_id)
-    doc = p['document']
+    return synthesize_narration(editable(project_id), engine)
+
+
+def approved_script(doc):
     script = current_script(doc)
     if not doc.get('approved_hash') or doc['approved_hash'] != production.fingerprint(doc):
         raise ValueError('현재 대본을 먼저 승인하세요.')
+    return script
+
+
+def audio_digest(path):
+    with path.open('rb') as audio:
+        return hashlib.file_digest(audio, 'sha256').hexdigest()
+
+
+@production.serialized
+def queue_narration(project_id):
+    import narration
+    import editing
+    p = production.project(project_id)
+    existing = production.active_job(p, voice=True)
+    if existing:
+        return existing
+    p = editable(project_id)
+    doc = p['document']
+    script = approved_script(doc)
+    engine_key = os.environ.get('MFLOW_TTS_ENGINE', 'mock').strip().lower()
+    engine = narration.configured_engine(engine_key)
+    voice = doc.get('narration') or {}
+    if voice.get('approved_hash') == doc['approved_hash'] and voice.get('engine') == engine.name and voice.get('audio_sha256'):
+        try:
+            editing.build_plan(doc['analysis'], script, voice, doc['source']['duration'])
+            if audio_digest(production.asset(project_id, 'narration')) == voice['audio_sha256']:
+                return {'status': 'completed', 'narration': voice, 'message': '생성된 나레이션을 다시 사용합니다.'}
+        except (OSError, ValueError):
+            pass
+    return production.enqueue_job(p, engine_key)
+
+
+def run_narration_job(p):
+    import narration
+    try:
+        synthesize_narration(p, narration.configured_engine(p['job_engine']))
+    except Exception as exc:
+        if not isinstance(exc, ValueError):
+            traceback.print_exc()
+        failed = production.project(p['id'])
+        failed.update(status='error', render_job_id=p['render_job_id'])
+        failed['document']['message'] = str(exc) if isinstance(exc, ValueError) else '나레이션 생성에 실패했습니다. 다시 시도하세요.'
+        production.store(failed)
+
+
+def synthesize_narration(p, engine):
+    import narration
+    import editing
+    doc = p['document']
+    script = approved_script(doc)
     run = production.PROJECT_ROOT / p['id'] / ('voice-' + uuid.uuid4().hex)
     result = narration.synthesize({**script, 'approved': True}, run, engine)
     editing.build_plan(doc['analysis'], script, result, doc['source']['duration'])
+    result['audio_sha256'] = audio_digest(run / result['audio_file'])
     result['audio_file'] = str((run / result['audio_file']).relative_to(production.PROJECT_ROOT / p['id']))
     result['approved_hash'] = doc['approved_hash']
     doc['narration'] = result

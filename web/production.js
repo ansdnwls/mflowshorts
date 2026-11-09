@@ -1,5 +1,5 @@
 let productionState=null,activeProject=null,productionDirty=false,uploading=false;
-const stageNames={draft:'원본 대기',source_ready:'대본 대기',analysis_ready:'분석 검토',analysis_confirmed:'분석 확정',script_ready:'승인 대기',approved:'렌더링 준비',rendering:'렌더링 중',completed:'완료',error:'오류'};
+const stageNames={draft:'원본 대기',source_ready:'대본 대기',analysis_ready:'분석 검토',analysis_confirmed:'분석 확정',script_ready:'승인 대기',approved:'렌더링 준비',rendering:'제작 작업 중',completed:'완료',error:'오류'};
 const stageProgress={draft:5,source_ready:25,analysis_ready:35,analysis_confirmed:45,script_ready:50,approved:65,rendering:80,completed:100,error:0};
 function productionAsset(id,kind,download=false){return `/api/production/asset?id=${encodeURIComponent(id)}&kind=${kind}${download?'&download=1':''}`;}
 function channelName(id){return productionState.channels.find(c=>c.id===id)?.name||'채널';}
@@ -36,7 +36,21 @@ async function uploadProduction(file){if(!file||uploading)return;if(file.size>20
 $('#production-upload').onchange=e=>uploadProduction(e.target.files[0]);
 $('#source-drop').ondragover=e=>{e.preventDefault();$('#source-drop').classList.add('dragging');};$('#source-drop').ondragleave=()=>$('#source-drop').classList.remove('dragging');$('#source-drop').ondrop=e=>{e.preventDefault();$('#source-drop').classList.remove('dragging');uploadProduction(e.dataTransfer.files[0]);};
 document.querySelectorAll('[data-close]').forEach(button=>button.onclick=()=>{const dialog=$('#'+button.dataset.close);dialog.querySelectorAll('video').forEach(v=>v.pause());dialog.close();});
-setInterval(async()=>{if(productionState?.projects.some(p=>p.status==='rendering')){try{const p=productionState.projects.find(p=>p.id===activeProject);await refreshProduction();if(p?.status==='rendering'&&$('#production-dialog').open)fillProduction(activeProject);}catch(e){message(e.message);}}},2500);
+let productionPolling=false;
+setInterval(async()=>{
+  if(productionPolling||workflowBusy||!productionState?.projects.some(p=>p.status==='rendering'))return;
+  productionPolling=true;
+  try{
+    const previousProjects=productionState.projects;
+    await refreshProduction();
+    const current=currentProduction();
+    const previous=previousProjects.find(p=>p.id===activeProject);
+    if(previous?.status==='rendering'&&current&&$('#production-dialog').open&&
+      (current.status!==previous.status||current.document.message!==previous.document.message)){
+      fillProduction(current.id);
+    }
+  }catch(error){message(error.message);}finally{productionPolling=false;}
+},2500);
 refreshProduction().catch(e=>message(e.message));
 
 $('#source-to-project').onclick=async()=>{try{const id=$('#research').elements.video_id.value;const data=Object.fromEntries(new FormData($('#research')));data.saved=$('#research').elements.saved.checked?1:0;await saveResearch(data);await refreshProduction();$('#research-dialog').close();if(!productionState.channels.length){switchView('channels');message('제작 채널을 등록한 뒤 원본 추적 노트에서 다시 이어가세요.');return;}const form=$('#new-project-form');form.reset();form.elements.source_video_id.value=id;form.elements.title.value=(snapshot.all_videos.find(v=>v.id===id)?.title||'새 제작 프로젝트').slice(0,100);form.elements.channel_id.innerHTML=productionState.channels.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('');$('#new-project-dialog').showModal();}catch(error){message(error.message);}};
@@ -77,8 +91,10 @@ function renderAnalysisWorkflow(p){
   const sectionLabels={hook:'훅',situation:'상황',ending:'반전/마무리'};
   $('#script-sentences').innerHTML=(generated?.sentences||[]).map(sentence=>`<article class="script-sentence ${sentence.kind==='inference'?'is-inference':'is-fact'}"><div><span class="tag">${esc(sectionLabels[sentence.section]||sentence.section||'문장')}</span> <b>${sentence.kind==='inference'?'추정':'사실'}</b> <small>${esc(sentence.scene_id||'')}</small></div><p>${esc(sentence.text)}</p></article>`).join('');
   $('#narration-generate').disabled=locked||!doc.approved_hash||!generated;
-  $('#production-qa').disabled=locked||!generated;
   const narration=doc.narration;
+  const currentVoice=!!narration&&!!doc.approved_hash&&narration.approved_hash===doc.approved_hash;
+  $('#production-qa').disabled=locked||!generated||!currentVoice;
+  if(generated&&!currentVoice)$('#production-render').disabled=true;
   $('#narration-status').textContent=narration?`${narration.mock?'모의 나레이션 · 무음 타이밍 시험':'나레이션 생성됨'} · ${narration.engine||''} · ${Number(narration.duration||0).toFixed(2)}초`:'나레이션을 생성하면 문장별 실제 파일 길이가 표시됩니다.';
   $('#narration-segments').innerHTML=narration?`<ol class="narration-timeline">${(narration.segments||[]).map(segment=>`<li><b>${Number(segment.start).toFixed(2)}–${Number(segment.end).toFixed(2)}초</b><span>${esc(segment.text||'')}</span><small>${esc(segment.scene_id||'')} · ${Number(segment.duration??segment.end-segment.start).toFixed(2)}초</small></li>`).join('')}</ol>`:'';
   const report=doc.qa_report;
@@ -86,9 +102,19 @@ function renderAnalysisWorkflow(p){
 }
 async function workflowAction(path,payload={},success='완료했습니다.'){
   if(workflowBusy)return;
+  const id=activeProject;
   workflowBusy=true;
   document.querySelectorAll('.workflow-actions button').forEach(button=>button.disabled=true);
-  try{await request('/api/production/'+path,{id:activeProject,...payload});await refreshProduction();workflowBusy=false;fillProduction(activeProject);message(success);}catch(error){workflowBusy=false;const p=currentProduction();if(p&&!analysisDirty)renderAnalysisWorkflow(p);else{$('#analysis-save').disabled=false;$('#analysis-confirm').disabled=false;$('#analysis-add').disabled=false;}message(error.message);}
+  try{
+    const result=await request('/api/production/'+path,{id,...payload});
+    await refreshProduction();
+    workflowBusy=false;
+    if(activeProject===id&&$('#production-dialog').open)fillProduction(id);
+    else if($('#production-dialog').open&&currentProduction()&&!analysisDirty)renderAnalysisWorkflow(currentProduction());
+    const project=productionState.projects.find(p=>p.id===id);
+    const narrationMessage=result.status==='completed'?result.message:project?.document.message||result.message;
+    message(path==='narration'?narrationMessage:success);
+  }catch(error){workflowBusy=false;const p=currentProduction();if(p&&!analysisDirty)renderAnalysisWorkflow(p);else{$('#analysis-save').disabled=false;$('#analysis-confirm').disabled=false;$('#analysis-add').disabled=false;}message(error.message);}
 }
 $('#analysis-scenes').addEventListener('input',markAnalysisDirty);
 $('#analysis-scenes').addEventListener('click',event=>{const card=event.target.closest('.analysis-scene');if(!card)return;if(event.target.closest('[data-scene-remove]')){card.remove();markAnalysisDirty();}if(event.target.closest('[data-scene-seek]')){const time=Number(card.querySelector('[data-scene-field="start"]').value);if(Number.isFinite(time))$('#production-source-preview').currentTime=time;}});
@@ -97,7 +123,7 @@ $('#analysis-start').onclick=async()=>{try{if(productionDirty)await saveProducti
 $('#analysis-save').onclick=async()=>{const analysis=readAnalysisEditor();try{if(productionDirty)await saveProduction();await workflowAction('analysis',{analysis},'분석을 저장했습니다. 내용을 검토한 뒤 확정하세요.');}catch(error){message(error.message);}};
 $('#analysis-confirm').onclick=async()=>{const analysis=readAnalysisEditor();try{if(productionDirty)await saveProduction();if(analysisDirty||!currentProduction()?.document.analysis){await request('/api/production/analysis',{id:activeProject,analysis});}await workflowAction('confirm-analysis',{},'분석을 확정했습니다. 대본을 생성할 수 있습니다.');}catch(error){message(error.message);}};
 $('#script-generate').onclick=async()=>{if(analysisDirty){message('분석 수정사항을 먼저 저장하고 확정하세요.');return;}try{if(productionDirty)await saveProduction();await workflowAction('generate-script',{},'대본을 생성했습니다. 사실·추정과 장면을 검토한 뒤 승인하세요.');}catch(error){message(error.message);}};
-$('#narration-generate').onclick=()=>{if(productionDirty||analysisDirty){message('변경사항을 저장하고 대본을 다시 승인하세요.');return;}workflowAction('narration',{},'나레이션 처리 결과와 문장별 길이를 확인하세요.');};
+$('#narration-generate').onclick=()=>{if(productionDirty||analysisDirty){message('변경사항을 저장하고 대본을 다시 승인하세요.');return;}workflowAction('narration');};
 $('#production-qa').onclick=()=>{if(productionDirty||analysisDirty){message('변경사항을 저장한 뒤 QA를 실행하세요.');return;}workflowAction('qa',{},'QA 리포트를 확인하세요.');};
 $('#offset-reset').onclick=()=>{const form=$('#production-form');for(const k of OFFSETS)form.elements[k].value=0;form.dispatchEvent(new Event('input',{bubbles:true}));};
 

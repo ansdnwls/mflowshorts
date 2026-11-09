@@ -57,6 +57,44 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(action=action.__name__), self.assertRaises(ValueError):
                 action(self.ident)
 
+    def test_narration_queue_recovers_and_reuses_only_intact_audio(self):
+        self.reviewed()
+        production.approve(self.ident)
+        with patch.dict('os.environ', {'MFLOW_TTS_ENGINE': 'mock'}):
+            queued = workflow.queue_narration(self.ident)
+            self.assertEqual(workflow.queue_narration(self.ident)['job_id'], queued['job_id'])
+            with self.assertRaises(ValueError):
+                production.start_render(self.ident)
+            with app.connect() as con:
+                con.execute("UPDATE production_render_jobs SET status='running', attempts=1")
+            app.init()
+            production.recover_renders()
+            self.assertTrue(production.process_next_render())
+            self.assertEqual(production.project(self.ident)['status'], 'approved')
+            with app.connect() as con:
+                row = con.execute('SELECT id,status,attempts FROM production_render_jobs').fetchone()
+            self.assertEqual(tuple(row), (queued['job_id'], 'completed', 2))
+            audio = production.asset(self.ident, 'narration')
+            self.assertEqual(workflow.queue_narration(self.ident)['status'], 'completed')
+            self.assertFalse(production.process_next_render())
+            audio.write_bytes(b'corrupted')
+            self.assertEqual(workflow.queue_narration(self.ident)['status'], 'queued')
+            self.assertTrue(production.process_next_render())
+            self.assertNotEqual(production.asset(self.ident, 'narration'), audio)
+
+    def test_narration_failure_keeps_approval_and_allows_retry(self):
+        self.reviewed()
+        production.approve(self.ident)
+        with patch.dict('os.environ', {'MFLOW_TTS_ENGINE': 'mock'}):
+            queued = workflow.queue_narration(self.ident)
+            with patch.object(narration, 'synthesize', side_effect=ValueError('TTS failed')):
+                self.assertTrue(production.process_next_render())
+            self.assertEqual(production.project(self.ident)['status'], 'error')
+            self.assertEqual(self.document()['message'], 'TTS failed')
+            self.assertNotEqual(workflow.queue_narration(self.ident)['job_id'], queued['job_id'])
+            self.assertTrue(production.process_next_render())
+            self.assertEqual(production.project(self.ident)['status'], 'approved')
+
     def test_mock_template_cannot_be_confirmed_or_generated_without_review(self):
         self.upload()
         result = workflow.analyze(self.ident)

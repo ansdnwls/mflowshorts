@@ -434,11 +434,13 @@ class Handler(BaseHTTPRequestHandler):
                 '/api/production/analyze': workflow.analyze,
                 '/api/production/confirm-analysis': workflow.confirm_analysis,
                 '/api/production/generate-script': workflow.generate_script,
-                '/api/production/narration': workflow.generate_narration,
                 '/api/production/qa': workflow.check_qa,
             }
             if self.path in workflow_actions:
                 return self.send_json(workflow_actions[self.path](str(data.get('id', ''))))
+            if self.path == '/api/production/narration':
+                result = workflow.queue_narration(str(data.get('id', '')))
+                return self.send_json(result, 200 if result['status']=='completed' else 202)
             if self.path == '/api/production/analysis':
                 return self.send_json(workflow.save_analysis(str(data.get('id', '')), data.get('analysis')))
             if self.path == '/api/production/update':
