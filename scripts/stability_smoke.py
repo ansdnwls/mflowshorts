@@ -89,6 +89,35 @@ def wait_render(production, ident, timeout=120):
     raise TimeoutError('Actual render exceeded 120 seconds')
 
 
+def run_cut_case(production, channel, source):
+    ident=production.create_project({'title':'구간 편집 검증','channel_id':channel})
+    with source.open('rb') as stream:
+        production.upload(ident,stream,source.stat().st_size)
+    cuts=[{'start':2.25,'end':3.25},{'start':0.25,'end':1.25}]
+    quote={'text':'앞으로 옮긴 하이라이트','start':0.1,'end':0.8,'x':0.5,'y':0.65,'size':54,'font':''}
+    production.update_project({'id':ident,'clips':cuts,'overlays':[quote],
+                               'cues':[{'text':'별도 자막','start':1,'end':1.9}]})
+    production.approve(ident)
+    wait_render(production,ident)
+    path=production.asset(ident,'output')
+    info=production.probe(path)
+    check(abs(info['duration']-2)<0.08,'Cut render duration mismatch')
+    check(info['audio'] and rms(path,0.4)>0.01,'Original audio lost')
+    check([color_at(path,t,info['width'],info['height']) for t in (0.5,1.5)]==['blue','red'],
+          'Highlights were not rendered in their edited order')
+    def white_pixels(at):
+        frame=ffmpeg('-ss',at,'-i',path,'-frames:v',1,'-vf',
+                     'crop=960:100:60:1160,format=rgb24','-f','rawvideo','-')
+        return sum(r>200 and g>200 and b>200 for r,g,b in zip(frame[::3],frame[1::3],frame[2::3]))
+    check(white_pixels(0.4)>50 and white_pixels(1.4)==0,'Quote was not timed independently')
+    with zipfile.ZipFile(production.asset(ident,'archive')) as archive:
+        manifest=json.loads(archive.read('project.json'))
+        check(manifest['clips']==cuts and manifest['overlays']==[quote],'Timeline not saved in archive')
+        check('00:00:01,000 --> 00:00:01,900' in archive.read('captions.srt').decode('utf-8'),
+              'Subtitle did not use output time')
+    return {'name':'manual-reordered-clips','passed':True,'output':str(path),'render_info':info}
+
+
 def run_case(production, workflow, narration, channel, name, source, generated, short_scene=False):
     ident = production.create_project({'title': name, 'channel_id': channel})
     with source.open('rb') as reader:
@@ -189,6 +218,12 @@ def main(argv=None):
         app.init()
         channel = production.create_channel({'name': '격리된 실제 렌더 검증', 'language': 'ko'})
         audio_source, silent_source = make_sources(work)
+        try:
+            case=run_cut_case(production,channel,audio_source)
+        except Exception as exc:
+            case={'name':'manual-reordered-clips','passed':False,'error':str(exc)}
+        report['cases'].append(case)
+        print(('PASS ' if case['passed'] else 'FAIL ')+case['name'],flush=True)
         for name, source, generated, short_scene in [
                 ('manual-audio', audio_source, False, False),
                 ('manual-noaudio', silent_source, False, False),

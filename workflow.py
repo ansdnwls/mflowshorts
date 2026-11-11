@@ -194,7 +194,12 @@ def check_publish_candidate(p):
     if voice.get('mock') is not False or voice.get('approved_hash') != doc['approved_hash']:
         raise ValueError('현재 승인 대본으로 실제 한국어 나레이션을 생성하세요.')
     report = doc.get('qa_report') or {}
-    if report.get('audio_scope') != 'rendered_mix' or report.get('passed') is not True or not report.get('output_sha256'):
+    if report.get('audio_scope') != 'rendered_mix' or not report.get('output_sha256'):
+        raise ValueError('최종 영상의 QA를 통과해야 합니다. 필요한 경우 다시 렌더링하세요.')
+    if not any(check.get('name')=='narration_presence' and check.get('status')=='passed' and
+               check.get('metrics', {}).get('peak', 0) > 0 for check in report.get('checks', [])):
+        raise ValueError('최종 믹스의 나레이션 신호가 확인되지 않았습니다. 설정을 확인하고 다시 렌더링하세요.')
+    if report.get('passed') is not True:
         raise ValueError('최종 영상의 QA를 통과해야 합니다. 필요한 경우 다시 렌더링하세요.')
     if not any(check.get('name')=='audio_clipping' and check.get('status')=='passed' and
                check.get('metrics', {}).get('peak', 0) > 0 for check in report.get('checks', [])):

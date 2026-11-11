@@ -49,17 +49,23 @@ class WindowsSAPI:
     name = 'windows-sapi-ko-KR'
     mock = False
 
+    def __init__(self, voice='', rate=0):
+        self.voice = voice
+        self.rate = rate
+
     code = r'''
-param([string]$TextPath, [string]$AudioPath)
+param([string]$TextPath, [string]$AudioPath, [string]$VoiceName, [int]$Rate)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Speech
 $speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer
 try {
     $voice = $speaker.GetInstalledVoices() | Where-Object {
-        $_.Enabled -and $_.VoiceInfo.Culture.Name -eq 'ko-KR'
+        $_.Enabled -and $_.VoiceInfo.Culture.Name -eq 'ko-KR' -and
+            (!$VoiceName -or $_.VoiceInfo.Name -eq $VoiceName)
     } | Select-Object -First 1
     if ($null -eq $voice) { throw 'Korean SAPI voice is not installed.' }
     $speaker.SelectVoice($voice.VoiceInfo.Name)
+    $speaker.Rate = $Rate
     $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(24000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)
     $speaker.SetOutputToWaveFile($AudioPath, $format)
     $speaker.Speak([System.IO.File]::ReadAllText($TextPath, [System.Text.Encoding]::UTF8))
@@ -78,7 +84,8 @@ try {
                 result = subprocess.run(
                     ['powershell.exe', '-NoProfile', '-NonInteractive',
                      '-ExecutionPolicy', 'Bypass', '-File', str(script_path),
-                     '-TextPath', str(text_path), '-AudioPath', str(output_path.resolve())],
+                     '-TextPath', str(text_path), '-AudioPath', str(output_path.resolve()),
+                     '-VoiceName', self.voice, '-Rate', str(self.rate)],
                     capture_output=True, timeout=90,
                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                 )
@@ -93,7 +100,7 @@ class WindowsOneCore(WindowsSAPI):
 
     name = 'windows-onecore-ko-KR'
     code = r'''
-param([string]$TextPath, [string]$AudioPath)
+param([string]$TextPath, [string]$AudioPath, [string]$VoiceName, [int]$Rate)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 $null = [Windows.Media.SpeechSynthesis.SpeechSynthesizer, Windows.Media.SpeechSynthesis, ContentType=WindowsRuntime]
@@ -103,12 +110,13 @@ $asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
     $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
 } | Select-Object -First 1
 $voice = [Windows.Media.SpeechSynthesis.SpeechSynthesizer]::AllVoices | Where-Object {
-    $_.Language -eq 'ko-KR'
+    $_.Language -eq 'ko-KR' -and (!$VoiceName -or $_.DisplayName -eq $VoiceName)
 } | Select-Object -First 1
 if ($null -eq $voice) { throw 'Korean OneCore voice is not installed.' }
 $speaker = New-Object Windows.Media.SpeechSynthesis.SpeechSynthesizer
 try {
     $speaker.Voice = $voice
+    if ($Rate) { $speaker.Options.SpeakingRate = 1.0 + $Rate * 0.1 }
     $text = [System.IO.File]::ReadAllText($TextPath, [System.Text.Encoding]::UTF8)
     $operation = $speaker.SynthesizeTextToStreamAsync($text)
     $task = $asTask.MakeGenericMethod($resultType).Invoke($null, @($operation))

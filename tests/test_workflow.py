@@ -1,6 +1,8 @@
 """Integration checks for persisted review, approval, and narration boundaries."""
 import io
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,6 +80,11 @@ class WorkflowTests(unittest.TestCase):
             workflow.approve_publish(self.ident, True, '직접 촬영')
         doc['qa_report']['audio_scope'] = 'rendered_mix'
         production.store(p)
+        with self.assertRaisesRegex(ValueError, '나레이션 신호'):
+            workflow.approve_publish(self.ident, True, '직접 촬영')
+        doc['qa_report']['checks'].append(
+            {'name': 'narration_presence', 'status': 'passed', 'metrics': {'peak': 0.5}})
+        production.store(p)
         for reviewed, rights in ((False, '직접 촬영'), (True, ' ')):
             with self.assertRaises(ValueError):
                 workflow.approve_publish(self.ident, reviewed, rights)
@@ -89,6 +96,46 @@ class WorkflowTests(unittest.TestCase):
             workflow.approve_publish(self.ident, True, '직접 촬영')
         production.update_project({'id': self.ident, 'headline': '새 제목'})
         self.assertNotIn('publish_approval', self.document())
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(production.FONT).is_file(),
+                         'FFmpeg, FFprobe and the production font are required')
+    def test_final_narration_qa_distinguishes_voice_from_original_audio(self):
+        source = Path(self.temp.name) / 'source.mp4'
+        subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=160x90:r=30:d=4',
+                        '-f', 'lavfi', '-i', 'sine=f=440:r=48000:d=4', '-c:v', 'libx264',
+                        '-c:a', 'aac', str(source)], check=True, capture_output=True, timeout=30)
+        with patch.object(self, 'upload', wraps=lambda: production.upload(
+                self.ident, io.BytesIO(source.read_bytes()), source.stat().st_size)):
+            self.reviewed()
+        production.approve(self.ident)
+
+        class TestTone:
+            name = 'test-tone'
+            mock = False
+
+            def synthesize(self, text, output_path):
+                subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                                'sine=f=880:r=24000:d=0.6', str(output_path)],
+                               check=True, capture_output=True, timeout=30)
+
+        workflow.generate_narration(self.ident, TestTone())
+        for track, expected in (({'volume': 70}, True), ({'muted': True}, False), ({'volume': 0}, False)):
+            with self.subTest(track=track):
+                production.update_project({'id': self.ident, 'audio_mix': {'narration': track}})
+                production.approve(self.ident)
+                production.start_render(self.ident)
+                self.assertTrue(production.process_next_render())
+                self.assertEqual(production.project(self.ident)['status'], 'completed')
+                report = self.document()['qa_report']
+                checks = {check['name']: check for check in report['checks']}
+                self.assertGreater(checks['audio_clipping']['metrics']['peak'], 0)
+                self.assertEqual(checks['narration_presence']['status'], 'passed' if expected else 'failed')
+                self.assertEqual(report['passed'], expected)
+                if expected:
+                    self.assertTrue(workflow.approve_publish(self.ident, True, '테스트 영상')['publish_approval'])
+                else:
+                    with self.assertRaisesRegex(ValueError, '나레이션 신호'):
+                        workflow.approve_publish(self.ident, True, '테스트 영상')
 
     def test_narration_queue_recovers_and_reuses_only_intact_audio(self):
         self.reviewed()

@@ -92,6 +92,14 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.request('GET','/api/state',host='attacker.example:8000')[0],403)
         self.assertEqual(self.request('POST','/api/scan',{},host='attacker.example')[0],403)
         self.assertEqual(self.request('GET','/api/state',host='localhost:8000')[0],200)
+    def test_draft_frame_route_uses_request_settings_without_saving(self):
+        draft={'id':'project','t':1.5,'settings':{'mirror':True},'clips':[],'blurs':[]}
+        png=b'\x89PNG'
+        with patch.object(app.production,'preview_frame',return_value=png) as preview, \
+                patch.object(app.production,'update_project') as update:
+            self.assertEqual(self.request('POST','/api/production/frame',draft),(200,png))
+        preview.assert_called_once_with('project',1.5,draft)
+        update.assert_not_called()
     def test_unexpected_error_returns_json_500(self):
         with patch.object(app,'state',side_effect=RuntimeError('boom')),patch('traceback.print_exc'):
             status,data=self.request('GET','/api/state')

@@ -87,7 +87,7 @@ def _fmt(value):
     return f'{value:.6f}'
 
 
-def ffmpeg_filters(plan, has_source_audio=True, mute=False, duck_volume=0.18):
+def ffmpeg_filters(plan, has_source_audio=True, mute=False, duck_volume=0.18, *, video_only=False):
     """Input 0 = full source, input 1 = narration WAV; return labeled graph.
 
     Match source clips, hold their last frames as needed, duck only the original
@@ -112,7 +112,7 @@ def ffmpeg_filters(plan, has_source_audio=True, mute=False, duck_volume=0.18):
         normalized.append(values)
         expected_start = end
     count, total = len(normalized), expected_start
-    with_original = bool(has_source_audio and not mute)
+    with_original = bool(has_source_audio and not mute and not video_only)
     filters = ['[0:v]split=' + str(count) + ''.join(f'[srcv{i}]' for i in range(count))]
     if with_original:
         filters.append('[0:a]asplit=' + str(count) + ''.join(f'[srca{i}]' for i in range(count)))
@@ -127,6 +127,8 @@ def ffmpeg_filters(plan, has_source_audio=True, mute=False, duck_volume=0.18):
                            f'aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,'
                            f'apad=whole_dur={duration},atrim=duration={duration}[a{index}]')
     filters.append(''.join(f'[v{i}]' for i in range(count)) + f'concat=n={count}:v=1:a=0[matched_video]')
+    if video_only:
+        return {'filters': filters, 'video_label': 'matched_video', 'audio_label': None}
     filters.append(f'[1:a]asetpts=PTS-STARTPTS,aresample=48000,'
                    f'aformat=sample_fmts=fltp:channel_layouts=stereo,'
                    f'apad=whole_dur={_fmt(total)},atrim=duration={_fmt(total)}[narration_audio]')

@@ -11,6 +11,8 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import share_import
+import public_share_video
 
 ROOT = Path(__file__).resolve().parent
 VENDOR = ROOT / 'data/vendor/douyin-downloader'
@@ -128,8 +130,123 @@ def tiktok_search(task):
     return {'videos':videos}
 
 
+def share_error(exc):
+    detail=str(exc).lower()
+    if any(word in detail for word in ('certificate','ssl','tls')):
+        return '플랫폼의 TLS 연결을 확인할 수 없습니다.'
+    if any(word in detail for word in ('cookies','login','log in','sign in','captcha','verification')):
+        return '플랫폼이 로그인 또는 추가 확인을 요구합니다.'
+    if any(word in detail for word in ('403','412','429','502','connection','getaddrinfo','timed out')):
+        return '플랫폼 또는 영상 서버가 연결을 거절했거나 응답하지 않았습니다.'
+    return '공개 영상 데이터를 가져오지 못했습니다. 링크 또는 플랫폼 접근 상태를 확인하세요.'
+
+
+def public_share_fallback(task,url,result):
+    platform=task['platform']
+    info,media,detail=public_share_video.browser_details(platform,url)
+    result={**result}
+    if info:
+        for key in ('title','author','author_id'):
+            value=info.get(key)
+            if isinstance(value,str) and value.strip():
+                result[key]=' '.join(value.split())[:300]
+        if info.get('is_video') is False:
+            return {**result,'status':'unsupported','message':'재생 가능한 영상 게시물만 가져올 수 있습니다.'}
+    if not media:
+        prefix=result.get('message','')
+        return {**result,'message':' '.join(filter(None,(prefix,detail)))}
+    result.update(provider='public_browser',status='error')
+    if not task.get('download'):
+        return {**result,'status':'metadata_only','message':'공개 페이지에서 게시물과 재생 영상을 확인했습니다. 사용 허락 근거를 입력하면 가져올 수 있습니다.'}
+    try:
+        filename=public_share_video.download(platform,media,task['directory'])
+    except ValueError as exc:
+        return {**result,'message':str(exc)}
+    return {**result,'status':'downloaded','filename':filename}
+
+
+def import_share(task):
+    platform=task['platform']
+    result={'status':'error','original_url':'','title':'','author':'','author_id':''}
+    try:
+        url=share_import.resolve(platform,task['url'])
+    except ValueError as exc:
+        return {**result,'message':str(exc)}
+    result['original_url']=share_import.public_url(url,platform)
+    if platform=='Kuaishou' or platform=='Xiaohongshu' and urllib.parse.urlsplit(url).hostname=='www.rednote.com':
+        return public_share_fallback(task,url,result)
+    import yt_dlp
+    options={'quiet':True,'no_warnings':True,'noplaylist':True,'socket_timeout':12,
+             'retries':0,'fragment_retries':0,'extractor_retries':0,'cachedir':False,
+             'ignore_no_formats_error':True}
+    cookie_path=cookies(platform)
+    if cookie_path:
+        options['cookiefile']=cookie_path
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            info=downloader.extract_info(url,download=False)
+    except yt_dlp.utils.DownloadError as exc:
+        result['message']=share_error(exc)
+        return public_share_fallback(task,url,result) if platform in ('Douyin','Xiaohongshu') else result
+    if not isinstance(info,dict) or info.get('entries') is not None:
+        return {**result,'message':'개별 영상 게시물의 공개 정보를 읽지 못했습니다.'}
+    for key, value in {'title':info.get('title'), 'author':info.get('uploader') or info.get('creator'),
+                       'author_id':info.get('uploader_id')}.items():
+        if isinstance(value,str) and not (key=='title' and re.fullmatch(r'.+ video #[a-zA-Z0-9_-]+',value)):
+            result[key]=' '.join(value.split())[:300]
+    candidate=info.get('webpage_url')
+    if isinstance(candidate,str):
+        try:
+            found,canonical,short=share_import.classify(candidate)
+            if found==platform and not short:
+                result['original_url']=share_import.public_url(canonical,platform)
+        except ValueError:
+            pass
+    formats=info.get('formats') or []
+    has_video=any(f.get('vcodec')!='none' and (f.get('vcodec') or f.get('ext') in ('mp4','mov','webm'))
+                  for f in formats if isinstance(f,dict))
+    if not has_video:
+        if platform=='Xiaohongshu':
+            image_only=bool(formats) and all(isinstance(f,dict) and f.get('ext') in ('jpg','jpeg','png','webp','gif') for f in formats)
+            if image_only:
+                return {**result,'status':'unsupported','message':'샤오홍슈에서 재생 가능한 영상 게시물만 자동으로 가져올 수 있습니다.'}
+            return public_share_fallback(task,url,{**result,'message':'샤오홍슈가 영상 형식을 제공하지 않았습니다. 영상 공유 링크 또는 접근 상태를 확인하세요.'})
+        if platform=='Douyin':
+            return public_share_fallback(task,url,result)
+        return {**result,'message':'재생 가능한 영상 형식을 확인하지 못했습니다.'}
+    if not task.get('download'):
+        return {**result,'status':'metadata_only','message':'공개 정보를 확인했습니다. 사용 허락 근거를 입력하면 영상 가져오기를 요청할 수 있습니다.'}
+    directory=Path(task['directory'])
+    directory.mkdir(parents=True,exist_ok=True)
+    limit=200*1024*1024
+    def enforce_size(progress):
+        if max(progress.get('downloaded_bytes') or 0,progress.get('total_bytes') or 0)>limit:
+            raise MediaError('size_limit','다운로드 제한 200MB를 초과했습니다.')
+    seconds=info.get('duration')
+    height=360 if isinstance(seconds,(int,float)) and seconds>300 else 720
+    resolution=f'[height<=?{height}]'
+    options.update({'ignore_no_formats_error':False,'outtmpl':str(directory/'video.%(ext)s'),
+                    'format':f'b[ext=mp4][vcodec^=avc1]{resolution}/bv[ext=mp4][vcodec^=avc1]{resolution}+ba[ext=m4a]/b[ext=mp4]{resolution}/b{resolution}',
+                    'merge_output_format':'mp4','max_filesize':limit,'noprogress':True,
+                    'progress_hooks':[enforce_size],'restrictfilenames':True})
+    if platform=='Bilibili':
+        options['http_chunk_size']=2*1024*1024
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            downloader.extract_info(url,download=True)
+    except (yt_dlp.utils.DownloadError,MediaError) as exc:
+        return {**result,'message':exc.message if isinstance(exc,MediaError) else share_error(exc)}
+    files=[p for p in directory.iterdir() if p.name in ('video.mp4','video.webm','video.mov')
+           and p.is_file() and 0<p.stat().st_size<=limit]
+    if len(files)!=1:
+        return {**result,'message':'200MB 이하의 완성된 영상 파일을 확인하지 못했습니다.'}
+    return {**result,'status':'downloaded','filename':files[0].name}
+
+
 def run(task):
     platform=task['platform']; action=task['action']
+    if action=='share_import':
+        return import_share(task)
     preflight('https://www.douyin.com/' if platform=='Douyin' else 'https://www.tiktok.com/')
     if action in ('search','hot'):
         return asyncio.run(douyin_discover(task)) if platform=='Douyin' else tiktok_search(task)
