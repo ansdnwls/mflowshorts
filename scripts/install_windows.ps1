@@ -100,7 +100,7 @@ Update-SessionPath
 # 1. Python ---------------------------------------------------------------
 Write-Step 'Python 3.11 이상'
 $Python = Find-Python
-if (-not $Python -and (Install-WithWinget 'Python.Python.3.12' 'Python 3.12')) { $Python = Find-Python }
+if (-not $Python -and (Install-WithWinget 'Python.Python.3.11' 'Python 3.11')) { $Python = Find-Python }
 if ($Python) { Add-Result 'Python' 'OK' "$($Python.Version) ($($Python.Path))" }
 else { Add-Result 'Python' '실패' 'Python 3.11 이상을 찾지 못했습니다. python.org 설치 시 "Add python.exe to PATH"를 선택하세요.' }
 
@@ -258,5 +258,5 @@ if ($failed.Count -gt 0) {
 }
 if ($warned.Count -gt 0) { Write-Host "경고 $($warned.Count)개가 있습니다." -ForegroundColor Yellow }
 else { Write-Host '모두 준비됐습니다.' -ForegroundColor Green }
-Write-Host '새로 설치한 프로그램이 있으면 새 cmd 창을 연 뒤 실행하세요:  set PORT=8010  그다음  python app.py'
+Write-Host '새로 설치한 프로그램이 있으면 새 cmd 창을 연 뒤 실행하세요:  set PORT=8020  그다음  python app.py'
 exit 0

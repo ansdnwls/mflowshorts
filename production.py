@@ -15,6 +15,9 @@ import uuid
 import zipfile
 import functools
 import traceback
+import audio_mixer
+import caption_drafts
+import manual_timeline
 
 PROJECT_ROOT = Path(os.environ.get('MFLOW_PROJECT_ROOT',Path(__file__).parent/'data/projects'))
 FONT_CANDIDATES = ['/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc','C:/Windows/Fonts/malgunbd.ttf','/System/Library/Fonts/AppleSDGothicNeo.ttc']
@@ -45,6 +48,8 @@ STYLES = {'basic':{'name':'기본 스타일','title':'#ffe34a','title2':'#ff5a5a
 LOCK = threading.Lock()
 CONNECT = None
 CONFIG_LOCK = threading.RLock()
+RENDER_WAKE = threading.Event()
+MAX_RENDER_ATTEMPTS = 3
 
 def serialized(function):
     @functools.wraps(function)
@@ -59,12 +64,53 @@ def init(connect):
     CONNECT = connect
     with CONNECT() as con:
         con.executescript('''CREATE TABLE IF NOT EXISTS production_channels (id TEXT PRIMARY KEY,name TEXT,language TEXT,template TEXT,created_at TEXT);
-        CREATE TABLE IF NOT EXISTS production_projects (id TEXT PRIMARY KEY,title TEXT,channel_id TEXT,status TEXT,document TEXT,created_at TEXT,updated_at TEXT);''')
+        CREATE TABLE IF NOT EXISTS production_projects (id TEXT PRIMARY KEY,title TEXT,channel_id TEXT,status TEXT,document TEXT,created_at TEXT,updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS production_recovery_drafts (
+            project_id TEXT PRIMARY KEY, revision TEXT NOT NULL, snapshot TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS production_render_jobs (
+            project_id TEXT PRIMARY KEY, id TEXT NOT NULL, status TEXT NOT NULL,
+            attempts INTEGER NOT NULL, created_at TEXT NOT NULL
+        );''')
+        columns={row['name'] for row in con.execute('PRAGMA table_info(production_render_jobs)')}
+        if 'engine' not in columns:
+            con.execute('ALTER TABLE production_render_jobs ADD COLUMN engine TEXT')
+        channels={row['name'] for row in con.execute('PRAGMA table_info(production_channels)')}
+        if 'narration_profile' not in channels:
+            con.execute("ALTER TABLE production_channels ADD COLUMN narration_profile TEXT NOT NULL DEFAULT '{}'")
+
+
+def recovery_drafts():
+    with CONNECT() as con:
+        rows = con.execute('SELECT snapshot FROM production_recovery_drafts')
+        return [json.loads(row['snapshot']) for row in rows]
+
+
+def write_recovery_draft(data):
+    project_id, revision = data.get('id'), data.get('revision')
+    if not isinstance(project_id, str) or not isinstance(revision, str):
+        raise ValueError('복구본 식별자가 올바르지 않습니다.')
+    with CONNECT() as con:
+        if data.get('discard') is True:
+            con.execute('DELETE FROM production_recovery_drafts WHERE project_id=? AND revision=?',
+                        (project_id, revision))
+            return
+        if not isinstance(data.get('edit'), str) or not isinstance(data.get('at'), int):
+            raise ValueError('복구본 형식이 올바르지 않습니다.')
+        result = con.execute('''
+            INSERT INTO production_recovery_drafts (project_id, revision, snapshot)
+            SELECT id, ?, ? FROM production_projects WHERE id=?
+            ON CONFLICT(project_id) DO UPDATE SET revision=excluded.revision, snapshot=excluded.snapshot
+        ''', (revision, json.dumps(data, ensure_ascii=False), project_id))
+        if not result.rowcount:
+            raise ValueError('프로젝트를 찾을 수 없습니다.')
 
 
 def state():
     with CONNECT() as con:
-        channels=[{**dict(r),'template':json.loads(r['template'])} for r in con.execute('SELECT * FROM production_channels ORDER BY created_at')]
+        channels=[{**dict(r),'template':json.loads(r['template']),
+                   'narration_profile':json.loads(r['narration_profile'])}
+                  for r in con.execute('SELECT * FROM production_channels ORDER BY created_at')]
         projects=[]
         for row in con.execute('SELECT * FROM production_projects ORDER BY updated_at DESC'):
             p=dict(row);p['document']=json.loads(p['document']);projects.append(p)
@@ -89,8 +135,15 @@ def project(project_id):
     p=dict(row);p['document']=json.loads(p['document']);return p
 
 
-def store(p):
-    with CONNECT() as con: con.execute('UPDATE production_projects SET title=?,channel_id=?,status=?,document=?,updated_at=? WHERE id=?',(p['title'],p['channel_id'],p['status'],json.dumps(p['document'],ensure_ascii=False),now(),p['id']))
+def store(p, con=None):
+    if con is None:
+        with CONFIG_LOCK, CONNECT() as connection:
+            return store(p, connection)
+    con.execute('UPDATE production_projects SET title=?,channel_id=?,status=?,document=?,updated_at=? WHERE id=?',(p['title'],p['channel_id'],p['status'],json.dumps(p['document'],ensure_ascii=False),now(),p['id']))
+    if p.get('render_job_id') and p['status'] in ('approved', 'completed', 'error'):
+        job_status='completed' if p['status']=='approved' else p['status']
+        con.execute('UPDATE production_render_jobs SET status=? WHERE project_id=? AND id=?',
+                    (job_status, p['id'], p['render_job_id']))
 
 
 def default_settings():return {'style':'basic','duration':58,'start':0,'mute':False,'mirror':False,'captions':True,'layout':'band','title_font':'','caption_font':'',**{k:0 for k in OFFSETS}}
@@ -153,6 +206,47 @@ def layout_filters(layout):
     return [f'scale={WIDTH}:{area}:force_original_aspect_ratio=increase',f'crop={WIDTH}:{area}','setsar=1',f'pad={WIDTH}:{HEIGHT}:0:{TITLE_HEIGHT}:black']
 
 
+def grade_filters(grade):
+    if not grade:
+        return []
+    contrast=1+grade['contrast']/100
+    brightness=grade['brightness']/100
+    warmth=grade['warmth']/100
+    channels=':'.join(f"{key}='clip((val-128)*{contrast:.6f}+128+{offset*255:.6f},0,255)'"
+                      for key,offset in zip('rgb',(brightness+warmth,brightness,brightness-warmth)))
+    saturation=1+grade['saturation']/100
+    weights=(0.2126,0.7152,0.0722)
+    matrix=':'.join(f'{a}{b}={weights[j]*(1-saturation)+(saturation if i==j else 0):.6f}'
+                    for i,a in enumerate('rgb') for j,b in enumerate('rgb'))
+    return ['format=rgb24','lutrgb='+channels,'colorchannelmixer='+matrix,'format=yuv420p']
+
+
+def clip_layout_filters(cfg, cut):
+    layout = cfg.get('layout', 'fill')
+    frame = cut.get('framing')
+    mirror = ['hflip'] if cfg['mirror'] else []
+    grade = grade_filters(cut.get('grade'))
+    if not frame or frame == {'mode': 'default', 'zoom': 1, 'x': 0, 'y': 0}:
+        return grade + layout_filters(layout) + mirror
+
+    area = (HEIGHT if layout == 'fill' else VIDEO_BOTTOM) - TITLE_HEIGHT
+    fit = frame['mode'] == 'fit' or (frame['mode'] == 'default' and layout == 'fit')
+    bound = 'min' if fit else 'max'
+    display_width = 'iw*if(gt(sar,0),sar,1)'
+    factor = f'{frame["zoom"]}*{bound}({WIDTH}/({display_width}),{area}/ih)'
+    # Apply mirroring before translation so dragging right always moves the picture right.
+    x, y = round(frame['x']), round(frame['y'])
+    padded_w, padded_h = f'max(iw,{WIDTH})+{2*abs(x)}', f'max(ih,{area})+{2*abs(y)}'
+    return grade + mirror + [
+        f"scale=w='max(2,round({display_width}*{factor}))':h='max(2,round(ih*{factor}))'",
+        'setsar=1', 'format=yuv444p',
+        f"pad=w='{padded_w}':h='{padded_h}':x=floor((ow-iw)/2):y=floor((oh-ih)/2):color=black",
+        f'crop={WIDTH}:{area}:ceil((iw-ow)/2)-({x}):ceil((ih-oh)/2)-({y})',
+        f'pad={WIDTH}:{HEIGHT}:0:{TITLE_HEIGHT}:black',
+        'format=yuv420p',
+    ]
+
+
 def settings(data):
     result={**default_settings(),**{k:v for k,v in data.items() if k in default_settings()}}
     try:result['duration']=float(result['duration']);result['start']=float(result['start'])
@@ -174,7 +268,9 @@ def create_channel(data):
     name=str(data.get('name','')).strip();language=data.get('language','ko')
     if not name or len(name)>60 or language not in ('ko','en','zh'):raise ValueError('채널 이름(60자 이하)과 언어를 확인하세요.')
     ident=uuid.uuid4().hex
-    with CONNECT() as con:con.execute('INSERT INTO production_channels VALUES (?,?,?,?,?)',(ident,name,language,json.dumps(default_settings()),now()))
+    with CONNECT() as con:
+        con.execute('INSERT INTO production_channels (id,name,language,template,created_at) VALUES (?,?,?,?,?)',
+                    (ident,name,language,json.dumps(default_settings()),now()))
     return ident
 
 
@@ -190,7 +286,7 @@ def credit_line(channel):
 
 
 @serialized
-def create_project(data):
+def create_project(data, share_record=None):
     title=str(data.get('title','')).strip();channel_id=str(data.get('channel_id',''))
     if not title or len(title)>100:raise ValueError('프로젝트 이름은 1~100자입니다.')
     with CONNECT() as con: channel=con.execute('SELECT * FROM production_channels WHERE id=?',(channel_id,)).fetchone()
@@ -208,10 +304,16 @@ def create_project(data):
         doc['credit']=credit_line(video['channel'])
         doc['context']=((note['attribution']+'\n'+note['notes']).strip() if note else '')[:2000]
         doc['source_video_id']=str(data['source_video_id'])
-        with CONNECT() as con:material=con.execute('SELECT hypothesis,angle FROM material_notes WHERE video_id=?',(doc['source_video_id'],)).fetchone()
+        with CONNECT() as con:
+            material=con.execute('SELECT hypothesis,angle FROM material_notes WHERE video_id=?',
+                                 (doc['source_video_id'],)).fetchone()
         if material:
-            doc['material_brief']={'hypothesis':material['hypothesis'],'angle':material['angle']}
-            doc['context']=('새 해석: '+material['angle']+'\n흥행 이유 가설: '+material['hypothesis']+'\n'+doc['context']).strip()[:2000]
+            doc['material_brief']=dict(material)
+            doc['context']=('새 해석: '+material['angle']+'\n흥행 이유 가설: '+material['hypothesis']+
+                            '\n'+doc['context']).strip()[:2000]
+    if share_record is not None:
+        doc['share_import']=share_record
+        doc['source_url']=share_record['original_url'] or share_record['share_url']
     with CONNECT() as con:con.execute('INSERT INTO production_projects VALUES (?,?,?,?,?,?,?)',(ident,title,channel_id,'draft',json.dumps(doc,ensure_ascii=False),now(),now()))
     return ident
 
@@ -225,6 +327,11 @@ def update_project(data):
     context=str(data.get('context',doc.get('context',''))).strip()
     source_url=str(data.get('source_url',doc.get('source_url',''))).strip()
     credit=re.sub(r'\s+',' ',str(data.get('credit',doc.get('credit','')))).strip();cards=comments(data.get('comments',doc.get('comments',[])));boxes=blurs(data.get('blurs',doc.get('blurs',[])));timeline=cues(data.get('cues',doc.get('cues',[])))
+    overlays=text_overlays(data.get('overlays',doc.get('overlays',[])))
+    cuts=manual_timeline.clips(data.get('clips',doc.get('clips',[])),(doc.get('source') or {}).get('duration',0))
+    quotes=manual_timeline.quotes(data.get('quotes',doc.get('quotes',[])))
+    mix=data.get('audio_mix',doc.get('audio_mix'))
+    if mix is not None:mix=audio_mixer.settings(mix,audio_directory(p))
     if len(credit)>60:raise ValueError('출처 표시는 60자 이내로 입력하세요.')
     if len(textwrap.wrap(headline,18))>3:raise ValueError('상단 제목은 화면에서 3줄(약 50자) 이내여야 합니다. 줄여서 입력하세요.')
     if not title or len(title)>100 or not headline or len(headline)>60 or len(script)>800 or len(context)>2000 or len(source_url)>2048:raise ValueError('이름 100자·상단 제목 60자·대본 800자·맥락 메모 2000자 이내로 입력하세요.')
@@ -232,13 +339,49 @@ def update_project(data):
         from urllib.parse import urlsplit
         u=urlsplit(source_url)
         if u.scheme!='https' or not u.hostname or u.username or u.password:raise ValueError('출처는 HTTPS 링크로 입력하세요.')
-    p['title']=title;doc.update({'script':script,'headline':headline,'context':context,'source_url':source_url,'credit':credit,'credit_on':bool(data.get('credit_on',doc.get('credit_on',True))),'comments':cards,'blurs':boxes,'cues':timeline,'settings':settings(data.get('settings',doc['settings'])),'approved_hash':None})
-    doc.pop('output',None);doc.pop('archive',None)
-    p['status']='script_ready' if script and doc['source'] else 'source_ready' if doc['source'] else 'draft'
-    doc['message']='대본과 설정을 검토한 뒤 승인하세요.' if p['status']=='script_ready' else '원본과 대본을 준비하세요.'
-    store(p)
+    changes={'script':script,'headline':headline,'context':context,'source_url':source_url,
+             'credit':credit,'credit_on':bool(data.get('credit_on',doc.get('credit_on',True))),
+             'comments':cards,'blurs':boxes,'cues':timeline,'overlays':overlays,'clips':cuts,
+             'quotes':quotes,'audio_mix':mix,'settings':settings(data.get('settings',doc['settings']))}
+    previous={key:doc.get(key) for key in changes}
+    for key in ('comments','blurs','cues','overlays','clips','quotes'):
+        previous[key]=doc.get(key,[])
+    for key in ('context','source_url','credit'):
+        previous[key]=doc.get(key,'')
+    previous.update(credit_on=doc.get('credit_on',True),settings={**default_settings(),**doc['settings']})
+    changed=title!=p['title'] or changes!=previous
+    if changed:
+        range_changed=any(changes['settings'][key]!=previous['settings'][key] for key in ('start','duration'))
+        if range_changed and (doc.get('analysis') or {}).get('provider')=='reviewed_frames':
+            doc.pop('analysis')
+            if doc.pop('generated_script',None):
+                changes['script']=''
+                script=''
+            doc.pop('narration',None)
+        if (mix or doc.get('audio_mix')) and current_voice(doc):
+            doc['narration']['mixer_base_hash']=fingerprint(doc, include_mix=False)
+        if script != doc['script']:
+            doc.pop('narration',None)
+        if script!=doc['script'] or cuts!=previous['clips'] or range_changed:
+            doc.pop('narration_id',None)
+        for key in ('qa_report','publish_approval','output','archive'):
+            doc.pop(key,None)
+        bundle_voice=doc.get('bundle_narration')
+        if bundle_voice and any(changes[key]!=previous[key] for key in ('script','cues','clips','audio_mix')):
+            doc.pop('bundle_narration',None)
+            track=(mix or {}).get('narration',{})
+            if any(changes[key]!=previous[key] for key in ('script','cues','clips')) and (
+                    track.get('clip') or {}).get('id')==bundle_voice['clip_id']:
+                track.pop('clip')
+        p['title']=title
+        doc.update(changes,approved_hash=None)
+        if mix is None:doc.pop('audio_mix',None)
+        p['status']='script_ready' if (script or cuts or mix) and doc['source'] else 'source_ready' if doc['source'] else 'draft'
+        doc['message']='대본과 설정을 검토한 뒤 승인하세요.' if p['status']=='script_ready' else '원본과 대본을 준비하세요.'
+        store(p)
     if data.get('save_template'):
-        with CONNECT() as con:con.execute('UPDATE production_channels SET template=? WHERE id=?',(json.dumps(doc['settings']),p['channel_id']))
+        with CONNECT() as con:con.execute('UPDATE production_channels SET template=? WHERE id=?',(json.dumps(changes['settings']),p['channel_id']))
+    return changed
 
 
 def probe(path):
@@ -276,19 +419,112 @@ def upload(project_id, reader, size):
 def save_source(project_id,path,info):
     p=project(project_id)
     if p['status']=='rendering':raise ValueError('렌더링 중에는 원본을 바꿀 수 없습니다.')
-    p['document'].update({'source':{'filename':path.name,**info},'approved_hash':None,'message':'원본 업로드 완료. 스타일과 대본을 준비하세요.'})
-    p['document'].pop('output',None);p['document'].pop('archive',None)
-    p['status']='script_ready' if p['document']['script'] else 'source_ready';store(p)
+    apply_source(p,path,info)
+    record=p['document'].get('share_import')
+    if record and record['status'] not in ('queued','running'):
+        record.update(status='manual',message='직접 올린 원본으로 편집할 수 있습니다.')
+    store(p)
     return info
 
 
-def fingerprint(doc):
+def apply_source(p,path,info):
+    bundle_voice=p['document'].pop('bundle_narration',None)
+    track=(p['document'].get('audio_mix') or {}).get('narration',{})
+    if bundle_voice and (track.get('clip') or {}).get('id')==bundle_voice['clip_id']:
+        track.pop('clip')
+    p['document'].update({'source':{'filename':path.name,**info},'approved_hash':None,'message':'원본 업로드 완료. 스타일과 대본을 준비하세요.'})
+    p['document'].pop('output',None);p['document'].pop('archive',None)
+    if p['document'].get('generated_script'):p['document']['script']=''
+    for key in ('analysis','generated_script','narration','narration_id','qa_report','publish_approval','clips','quotes'):
+        p['document'].pop(key,None)
+    p['status']='script_ready' if p['document']['script'] else 'source_ready'
+
+
+def audio_directory(p):
+    return PROJECT_ROOT/p['id']/'audio'
+
+
+def upload_audio(project_id, reader, size):
+    p=project(project_id)
+    if p['status']=='rendering':raise ValueError('렌더링 중에는 오디오를 바꿀 수 없습니다.')
+    return audio_mixer.upload(audio_directory(p),reader,size)
+
+
+def fingerprint(doc, *, include_mix=True):
     # credit/comments only count when set, so projects approved before they existed stay approved.
     data={k:doc.get(k) for k in ('source','script','headline','settings')}
-    data.update({k:doc[k] for k in ('credit','comments','blurs','cues') if doc.get(k)})
+    data.update({k:doc[k] for k in ('analysis','generated_script') if doc.get(k)})
+    data.update({k:doc[k] for k in ('credit','comments','blurs','cues','overlays','clips','quotes') if doc.get(k)})
+    if include_mix and doc.get('audio_mix'):data['audio_mix']=doc['audio_mix']
+    if not include_mix:data['settings']={key:value for key,value in doc['settings'].items() if key!='mute'}
     if doc.get('credit_on') is False:data['credit_on']=False
     if doc.get('narration_id'):data['narration_id']=doc['narration_id']
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+
+def current_voice(doc):
+    voice=doc.get('narration')
+    if voice and ((doc.get('approved_hash') and voice.get('approved_hash')==doc['approved_hash']) or
+                  voice.get('mixer_base_hash')==fingerprint(doc,include_mix=False)):
+        return voice
+    return None
+
+
+def uploaded_voice(doc):
+    return (doc.get('audio_mix') or {}).get('narration',{}).get('clip')
+
+
+OVERLAY_STYLE = {'color':'#ffffff','outline_color':'#000000','outline_width':3,
+                 'background_color':'#000000','background_opacity':0}
+
+
+def overlay_style(value):
+    if not isinstance(value,dict):
+        raise ValueError('글귀 스타일을 확인하세요.')
+    style={**OVERLAY_STYLE}
+    for key in ('color','outline_color','background_color'):
+        color=value.get(key,style[key])
+        if not isinstance(color,str) or not re.fullmatch(r'#[0-9a-fA-F]{6}',color):
+            raise ValueError('글귀 색상은 6자리 HEX 색상으로 입력하세요.')
+        style[key]=color.lower()
+    for key,maximum in (('outline_width',20),('background_opacity',100)):
+        number=value.get(key,style[key])
+        if type(number) not in (int,float) or not 0<=number<=maximum:
+            raise ValueError('외곽선은 0~20px, 배경 불투명도는 0~100%로 입력하세요.')
+        style[key]=round(number)
+    return style
+
+
+def text_overlays(value):
+    if not isinstance(value,list) or len(value)>40:
+        raise ValueError('글귀는 최대 40개까지 추가할 수 있습니다.')
+    fonts={font['file'] for font in available_fonts()} if value else set()
+    result=[]
+    for item in value:
+        if not isinstance(item,dict) or not isinstance(item.get('text'),str):
+            raise ValueError('글귀 내용을 입력하세요.')
+        text=' '.join(item['text'].split())
+        if not 1<=len(text)<=60:
+            raise ValueError('글귀는 1~60자로 입력하세요.')
+        try:
+            x,y,size,start,end=(float(item[k]) for k in ('x','y','size','start','end'))
+        except (KeyError,TypeError,ValueError,OverflowError):
+            raise ValueError('글귀 위치·크기·시간을 숫자로 입력하세요.') from None
+        if not (0<=x<=1 and 0<=y<=1 and 24<=size<=144):
+            raise ValueError('글귀 위치와 크기(24~144px)를 확인하세요.')
+        if not (0<=start<=60 and 0<=end<=60) or (end and round(end,2)<=round(start,2)):
+            raise ValueError('글귀 시간은 0~60초이며 끝은 시작보다 뒤여야 합니다(0이면 영상 끝까지).')
+        font=item.get('font','')
+        if not isinstance(font,str) or (font and font not in fonts):
+            raise ValueError('글귀 서체를 다시 선택하세요.')
+        overlay={'text':text,'x':round(x,4),'y':round(y,4),'size':round(size),
+                 'start':round(start,2),'end':round(end,2),'font':font}
+        if 'style' in item:
+            overlay['style']=overlay_style(item['style'])
+        if item.get('fixed') is True:
+            overlay['fixed']=True
+        result.append(overlay)
+    return result
 
 
 MAX_BLURS=6
@@ -316,7 +552,7 @@ PRE_MODES=('text','ai')  # handled outside FFmpeg, before the blur graph
 FEATHER=px(11)  # soft edge so the box outline does not show
 
 
-def blur_graph(chain,boxes,duration):
+def blur_graph(chain,boxes,duration,prefix=''):
     """Filter graph that hides each box on the laid-out frame, before the title and captions are drawn on top.
 
     erase: delogo fills the box from the pixels around it, so the text looks gone rather than smudged.
@@ -336,7 +572,9 @@ def blur_graph(chain,boxes,duration):
         mask=f"geq=lum='255*min(1,min(min(X,W-1-X),min(Y,H-1-Y))/{FEATHER})':cb=128:cr=128"
         on=f"between(t,{box['start']},{box['end'] or duration+1})"
         graph.append(f"[v{i}]split[m{i}][s{i}];[s{i}]crop={cw}:{ch}:{cx}:{cy},split[k{i}][q{i}];[q{i}]{mask}[a{i}];[k{i}]{hide}[h{i}];[h{i}][a{i}]alphamerge[f{i}];[m{i}][f{i}]overlay={cx}:{cy}:enable='{on}'[v{i+1}]")
-    return ';'.join(graph)+f';[v{len(boxes)}]null'
+    result=';'.join(graph)+f';[v{len(boxes)}]null'
+    # A narration graph already owns v0/a0 labels. Keep overlay branches distinct.
+    return re.sub(r'\[([a-z]+\d+)\]',lambda match:'['+prefix+match[1]+']',result) if prefix else result
 
 
 class ToolError(ValueError):
@@ -405,10 +643,11 @@ def erase_ai(source,output,boxes,log=None):
     Picture (preview): the tool always uses OCR + LaMa. Box times are not passed: detection finds when text is shown.
     """
     tool=ai_eraser()
-    if not tool:raise ToolError('AI 자막 지우기를 쓰려면 scripts\\install_ai_eraser.cmd 를 먼저 실행하세요.')
+    if not tool:raise ToolError('서버에 AI 자막 지우개(VSR)가 준비되지 않았어요.')
     python,root=tool;source,output=Path(source),Path(output)
     # Work on copies inside the tool's own (ASCII) folder: its video reader fails on Korean paths on Windows.
-    work=Path(tempfile.mkdtemp(dir=AI_ROOT));staged_in,staged_out=work/('in'+source.suffix),work/('out'+output.suffix)
+    work=Path(tempfile.mkdtemp(dir=AI_ROOT if os.name=='nt' else None)).resolve()
+    staged_in,staged_out=work/('in'+source.suffix),work/('out'+output.suffix)
     try:
         shutil.copyfile(source,staged_in)
         _run_ai(python,root,staged_in,staged_out,boxes,log)
@@ -440,16 +679,23 @@ def layout_frame(source,seek,vf,output):
 IMAGE_FORMATS='image2,png_pipe'
 
 
-def preview_frame(project_id,at):
+def preview_frame(project_id,at,draft=None):
     """One PNG frame of the source with layout and blur boxes applied, to check the boxes before rendering."""
     p=project(project_id);doc=p['document'];cfg=doc['settings']
     if not doc.get('source'):raise ValueError('원본 영상을 먼저 업로드하세요.')
-    duration=min(cfg['duration'],doc['source']['duration']-cfg['start'])
+    cuts=doc.get('clips') or []
+    if draft is not None:
+        changes=draft.get('settings',{})
+        if not isinstance(changes,dict):raise ValueError('미리보기 설정을 확인하세요.')
+        cfg=settings({**cfg,**changes})
+        cuts=manual_timeline.clips(draft.get('clips',cuts),doc['source']['duration'])
+        doc={**doc,'blurs':blurs(draft.get('blurs',doc.get('blurs',[])))}
+    duration=manual_timeline.duration(cuts) if cuts else min(cfg['duration'],doc['source']['duration']-cfg['start'])
     at=float(at)
     if not math.isfinite(at):at=0
     at=min(max(at,0),max(duration-0.05,0))
-    vf=layout_filters(cfg.get('layout','fill'))
-    if cfg['mirror']:vf.append('hflip')
+    cut, source_at = manual_timeline.clip_at(cuts, at) if cuts else ({}, cfg['start'] + at)
+    vf=clip_layout_filters(cfg, cut)
     # -ss before -i resets t to 0, so shift the box times by the same amount.
     boxes=[{**b,'start':b['start']-at,'end':(b['end']-at) if b['end'] else 0} for b in doc.get('blurs') or [] if not b['end'] or b['end']>at]
     boxes=[{**b,'start':max(b['start'],0),'end':max(b['end'],0.01) if b['end'] else 0} for b in boxes]
@@ -458,11 +704,14 @@ def preview_frame(project_id,at):
     ai=[b for b in doc.get('blurs') or [] if b.get('mode')=='ai' and active(b)]
     boxes=[b for b in boxes if b.get('mode') not in PRE_MODES]
     source,start,formats=PROJECT_ROOT/project_id/doc['source']['filename'],cfg['start'],SOURCE_FORMATS
+    if cuts:
+        letters=[{**b,'start':0,'end':0} for b in letters if active(b)]
+        start=source_at-at
     with tempfile.TemporaryDirectory() as tmp:
         if ai:
             # The AI tool works on the laid-out frame; the steps below then start from its result.
             laid,source=Path(tmp)/'frame.png',Path(tmp)/'clean.png'
-            layout_frame(PROJECT_ROOT/project_id/doc['source']['filename'],cfg['start']+at,vf,laid)
+            layout_frame(PROJECT_ROOT/project_id/doc['source']['filename'],source_at,vf,laid)
             erase_ai(laid,source,ai)
             vf,start,at,formats=[],0,0,IMAGE_FORMATS
             letters=[{**b,'start':0,'end':0} for b in letters if active(b)]
@@ -482,10 +731,35 @@ CUE_POSITIONS=('bottom','middle','top')
 CUE_LOOKS={'outline':'Caption','box':'CaptionBox','accent':'CaptionAccent','lyric':'Lyric'}
 CUE_ACCENT='#ffe34a'
 MAX_CUES=40
+
+
+def cue_style(value,fonts):
+    if not isinstance(value,dict):
+        raise ValueError('자막 스타일을 확인하세요.')
+    result={}
+    for key in ('font','size','color','outline','outline_color','background'):
+        if key not in value:
+            continue
+        item=value[key]
+        if key=='font':
+            valid=isinstance(item,str) and (not item or item in fonts)
+        elif key in ('size','outline'):
+            low,high=(24,144) if key=='size' else (0,20)
+            valid=type(item) is int and low<=item<=high
+        else:
+            valid=isinstance(item,str) and (re.fullmatch(r'#[0-9a-fA-F]{6}',item) or (key=='background' and item==''))
+            if valid:item=item.lower()
+        if not valid:
+            raise ValueError('자막 서체·크기·색상·외곽선·배경 값을 확인하세요.')
+        result[key]=item
+    return result
+
+
 def cues(value):
     """Validate timeline lines: {'text','sub','start','end','pos','look','y'}. end 0 = until the next line."""
     if not isinstance(value,list) or len(value)>MAX_CUES:raise ValueError(f'자막 타임라인은 최대 {MAX_CUES}줄입니다.')
     result=[]
+    fonts={f['file'] for f in available_fonts()} if value else set()
     for item in value:
         if not isinstance(item,dict):raise ValueError('자막 타임라인 형식을 확인하세요.')
         text=re.sub(r'\s+',' ',str(item.get('text',''))).strip();sub=re.sub(r'\s+',' ',str(item.get('sub',''))).strip()
@@ -494,9 +768,15 @@ def cues(value):
         except (TypeError,ValueError,OverflowError):raise ValueError('자막 시점은 숫자로 입력하세요.') from None
         pos=item.get('pos') or 'bottom';look=item.get('look') or 'outline'
         if len(text)>60 or len(sub)>60:raise ValueError('자막 한 줄은 60자 이내로 입력하세요.')
-        if not all(math.isfinite(v) for v in (start,end)) or not 0<=start<=60 or not 0<=end<=60 or (end and end<=start):raise ValueError('자막 시점은 0~60초이고, 끝은 시작보다 뒤여야 합니다(0이면 다음 줄까지).')
+        if not all(math.isfinite(v) for v in (start,end)) or not 0<=start<=60 or not 0<=end<=60 or (end and round(end,2)<=round(start,2)):raise ValueError('자막 시점은 0~60초이고, 끝은 시작보다 뒤여야 합니다(0이면 다음 줄까지).')
         if pos not in CUE_POSITIONS or look not in CUE_LOOKS or not -OFFSET_LIMIT<=y<=OFFSET_LIMIT:raise ValueError('자막 위치와 모양을 다시 고르세요.')
-        result.append({'text':text,'sub':sub,'start':round(start,2),'end':round(end,2),'pos':pos,'look':look,'y':y})
+        row={'text':text,'sub':sub,'start':round(start,2),'end':round(end,2),'pos':pos,'look':look,'y':y}
+        custom=cue_style(item.get('style',{}),fonts)
+        if custom:row['style']=custom
+        if item.get('fixed') is True:row['fixed']=True
+        if 'evidence' in item:row['evidence']=caption_drafts.validate_evidence(item['evidence'])
+        if item.get('bundle_closing') is True:row['bundle_closing']=True
+        result.append(row)
     return sorted(result,key=lambda c:c['start'])
 
 
@@ -519,10 +799,12 @@ def cue_events(items,style,layout,duration,shift=0):
         start=min(cue['start'],duration);end=cue['end'] or (items[index+1]['start'] if index+1<len(items) else duration+1)
         end=min(end,duration+1)
         if end<=start:continue
-        name=CUE_LOOKS[cue['look']];base=CUE_ACCENT if cue['look']=='accent' else style['caption'] if cue['look'] in ('outline','box') else '#ffffff'
-        mark=style['highlight'] if cue['look']!='accent' else style['caption']
+        custom=cue.get('style',{})
+        name=f'Cue{index}' if custom else CUE_LOOKS[cue['look']]
+        base=custom.get('color',cue_color(cue['look'],style))
+        mark=custom.get('color',style['highlight'] if cue['look']!='accent' else style['caption'])
         text=r'\N'.join(' '.join(('{\\c'+ass_color(mark)+'}'+ass_text(w)+'{\\c'+ass_color(base)+'}') if marked else ass_text(w) for w,marked in line) for line in cue_lines(cue['text']))
-        if cue['sub']:text+=r'\N{\fs'+str(px(26))+r'\i0\c'+ass_color('#ffffff')+'}'+ass_text(cue['sub'])
+        if cue['sub']:text+=r'\N{\fs'+str(cue_sub_size(cue['look'],custom))+r'\i0\c'+ass_color(custom.get('color','#ffffff'))+'}'+ass_text(cue['sub'])
         align,y=anchors[cue['pos']]
         events.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},{name},,0,0,0,,{{\\an{align}\\pos({WIDTH//2},{y+px(cue["y"])+shift})}}{text}')
         plain=cue['text'].replace('*','')+('\n'+cue['sub'] if cue['sub'] else '')
@@ -548,21 +830,152 @@ def comments(value):
 @serialized
 def approve(project_id):
     p=project(project_id);doc=p['document']
-    if p['status']=='rendering' or not doc.get('source') or not doc.get('script'):raise ValueError('원본과 대본을 준비한 뒤 승인하세요.')
-    if doc['settings']['start']>=doc['source']['duration']:raise ValueError('시작 시간이 원본 길이보다 깁니다.')
-    doc['approved_hash']=fingerprint(doc);doc['message']='대본과 설정이 승인되었습니다. 렌더링을 시작할 수 있습니다.';p['status']='approved';store(p)
+    cuts=doc.get('clips') or []
+    if p['status']=='rendering' or not doc.get('source') or not (doc.get('script') or cuts or doc.get('audio_mix')):raise ValueError('원본과 대본, 편집 구간 또는 오디오 믹스를 준비한 뒤 승인하세요.')
+    if cuts and doc.get('generated_script'):raise ValueError('수동 구간 편집과 생성 대본의 음성 맞춤 편집은 별도 프로젝트에서 사용하세요.')
+    if not cuts and doc['settings']['start']>=doc['source']['duration']:raise ValueError('시작 시간이 원본 길이보다 깁니다.')
+    if not cuts and (doc.get('analysis') or doc.get('generated_script')):
+        import workflow
+        workflow.current_script(doc)
+    voice=current_voice(doc)
+    doc['approved_hash']=fingerprint(doc)
+    if voice and voice.get('mixer_base_hash')==fingerprint(doc,include_mix=False):
+        voice['approved_hash']=doc['approved_hash']
+    doc['message']='대본과 설정이 승인되었습니다. 렌더링을 시작할 수 있습니다.';p['status']='approved';store(p)
 
 
 @serialized
 def start_render(project_id):
     p=project(project_id);doc=p['document']
+    existing=active_job(p)
+    if existing:
+        return existing
     if p['status'] not in ('approved','completed','error') or not doc.get('approved_hash') or doc['approved_hash']!=fingerprint(doc):raise ValueError('현재 대본과 설정을 먼저 승인하세요.')
-    from narration import for_render
-    for_render(p)
     if not state()['render_available']:raise ValueError('FFmpeg/FFprobe와 한국어 글꼴 설치가 필요합니다.')
-    if not LOCK.acquire(blocking=False):raise ValueError('다른 영상이 렌더링 중입니다. 완료 후 다시 시도하세요.')
-    p['status']='rendering';doc['message']='세로 영상과 제목·대본 자막을 렌더링하고 있습니다.';store(p)
-    threading.Thread(target=render,args=(p,),daemon=True).start()
+    if doc.get('generated_script'):
+        import workflow
+        workflow.current_script(doc)
+        if not uploaded_voice(doc) and (not doc.get('narration') or doc['narration'].get('approved_hash') != doc['approved_hash']):
+            raise ValueError('현재 승인된 대본의 나레이션을 먼저 생성하세요.')
+    report=doc.get('qa_report') or {}
+    if p['status']=='completed' and (not doc.get('generated_script') or
+            report.get('output_sha256') and any(c.get('name')=='narration_presence' for c in report.get('checks',[]))):
+        try:
+            for kind in ('output','archive'):
+                if not asset(project_id,kind).stat().st_size:
+                    raise ValueError('empty render asset')
+            expected=(doc.get('qa_report') or {}).get('output_sha256')
+            if expected:
+                with asset(project_id,'output').open('rb') as video:
+                    if hashlib.file_digest(video,'sha256').hexdigest()!=expected:
+                        raise ValueError('render asset changed')
+        except (OSError,ValueError):
+            pass
+        else:
+            return {'status':'completed','message':'같은 설정으로 완료된 영상을 사용할 수 있습니다.'}
+    return enqueue_job(p)
+
+
+def active_job(p, *, voice=False):
+    if p['status']!='rendering':
+        return None
+    with CONNECT() as con:
+        job=con.execute("SELECT id,status,engine FROM production_render_jobs WHERE project_id=? AND status IN ('queued','running')",(p['id'],)).fetchone()
+    if job:
+        if bool(job['engine']) != voice:
+            raise ValueError('이 프로젝트의 다른 제작 작업이 진행 중입니다.')
+        return {'job_id':job['id'],'status':job['status'],'message':p['document']['message']}
+
+
+def enqueue_job(p, engine=None, con=None):
+    """Register a validated job while the caller holds CONFIG_LOCK."""
+    if con is None:
+        with CONNECT() as connection:
+            result=enqueue_job(p,engine,connection)
+        RENDER_WAKE.set()
+        return result
+    job_id=uuid.uuid4().hex
+    p['status']='rendering'
+    if not engine:
+        p['document'].pop('publish_approval',None)
+    message=('쇼츠 자동 제작 대기열에 등록했습니다.' if engine=='bundle' else
+             '나레이션 대기열에 등록했습니다.' if engine else '렌더 대기열에 등록했습니다.')
+    p['document']['message']=message
+    con.execute("""INSERT OR REPLACE INTO production_render_jobs
+            (project_id,id,status,attempts,created_at,engine) VALUES (?,?,'queued',0,?,?)""",
+                    (p['id'],job_id,now(),engine))
+    store(p,con)
+    return {'job_id':job_id,'status':'queued','message':message}
+
+
+@serialized
+def recover_renders():
+    """Restore persisted jobs on startup, before starting the worker."""
+    with CONNECT() as con:
+        rows=con.execute("""SELECT p.*, j.id AS render_job_id, j.attempts
+            FROM production_projects p LEFT JOIN production_render_jobs j
+            ON j.project_id=p.id AND j.status IN ('queued','running')
+            WHERE p.status='rendering'""").fetchall()
+        for row in rows:
+            p=dict(row)
+            p['document']=json.loads(p['document'])
+            if p['render_job_id'] and p['attempts'] < MAX_RENDER_ATTEMPTS:
+                con.execute("UPDATE production_render_jobs SET status='queued' WHERE id=?",(p['render_job_id'],))
+                p['document']['message']='앱이 다시 시작되어 제작 대기열을 복구했습니다.'
+            else:
+                p['status']='error'
+                p['document']['message']='제작 작업이 중단되었습니다. 다시 시도하세요.'
+            store(p,con)
+
+
+def process_next_render():
+    """Claim one queued render and finish it before taking the next."""
+    if not LOCK.acquire(blocking=False):
+        return False
+    handed_off=False
+    try:
+        with CONFIG_LOCK, CONNECT() as con:
+            con.execute('BEGIN IMMEDIATE')
+            row=con.execute("""SELECT p.*, j.id AS render_job_id, j.engine AS job_engine
+                FROM production_render_jobs j JOIN production_projects p ON p.id=j.project_id
+                WHERE j.status='queued' AND p.status='rendering'
+                ORDER BY j.created_at,j.id LIMIT 1""").fetchone()
+            if not row:
+                return False
+            p=dict(row)
+            p['document']=json.loads(p['document'])
+            con.execute("UPDATE production_render_jobs SET status='running',attempts=attempts+1 WHERE id=?",
+                        (p['render_job_id'],))
+            p['document']['message']='나레이션을 생성하고 있습니다.' if p['job_engine'] else '세로 영상과 자막을 렌더링하고 있습니다.'
+            store(p,con)
+        if p['job_engine']=='bundle':
+            import shorts_bundle
+            if not shorts_bundle.prepare_automation(p):
+                return True
+            handed_off=True
+            render(p)
+            return True
+        if p['job_engine']:
+            import workflow
+            workflow.run_narration_job(p)
+            return True
+        handed_off=True
+        render(p)
+        return True
+    finally:
+        if not handed_off:
+            LOCK.release()
+
+
+def render_worker(stop):
+    while not stop.is_set():
+        try:
+            if process_next_render():
+                continue
+        except Exception:
+            traceback.print_exc()
+        RENDER_WAKE.wait(1)
+        RENDER_WAKE.clear()
 
 
 def filter_path(path):
@@ -666,6 +1079,69 @@ def comment_events(cards,layout,duration,shift=0):
     return events
 
 
+def overlay_events(items,duration):
+    for index,item in enumerate(items):
+        start=item['start']
+        end=min(item['end'] or duration,duration)
+        if ass_time(end)==ass_time(start) or end<=start:
+            continue
+        size=item['size']
+        family,bold=ass_font(font_path(item['font']))
+        x,y=round(item['x']*WIDTH),round(item['y']*HEIGHT)
+        lines=textwrap.wrap(item['text'],max(1,round(WIDTH*0.85/size)),break_on_hyphens=False)
+        text=r'\N'.join(ass_text(line) for line in lines)
+        style={**OVERLAY_STYLE, **item.get('style',{})}
+        layer=3+2*index
+        span=f'{ass_time(start)},{ass_time(end)}'
+        if style['background_opacity']:
+            padding=math.ceil(size*0.16)+style['outline_width']
+            width=max(map(len,lines))*size+2*padding
+            height=math.floor(len(lines)*size*1.2+0.5)+2*padding
+            alpha=255-math.floor(style['background_opacity']*2.55+0.500001)
+            bg=rf'{{\an7\pos({x-width//2},{y-height//2})\p1\bord0\shad0\1c{ass_color(style["background_color"]).upper()}\1a&H{alpha:02X}&}}'
+            yield f'Dialogue: {layer},{span},Caption,,0,0,0,,{bg}m 0 0 l {width} 0 {width} {height} 0 {height}'
+            layer+=1
+        tags=rf'{{\an5\pos({x},{y})\fn{ass_text(family)}\fs{size}\b{int(bool(bold))}\c{ass_color(style["color"]).upper()}\3c{ass_color(style["outline_color"]).upper()}\bord{style["outline_width"]}\shad0}}'
+        yield f'Dialogue: {layer},{span},Caption,,0,0,0,,{tags}{text}'
+
+
+def cue_color(look,style):
+    return {'accent':CUE_ACCENT,'lyric':'#ffffff'}.get(look,style['caption'])
+
+
+def cue_sub_size(look,custom):
+    return round(px(26)*custom['size']/CUE_SIZES[look]) if 'size' in custom else px(26)
+
+
+CUE_SIZES={'outline':CAPTION_FONT,'box':px(40),'accent':CAPTION_FONT,'lyric':px(32)}
+
+
+def cue_ass_style(name,look,style,family,bold,custom):
+    box=look=='box'
+    italic=int(look=='lyric')
+    bold=0 if italic else bold
+    if 'font' in custom:
+        family,bold=ass_font(font_path(custom['font']))
+    color=ass_color(cue_color(look,style) if 'color' not in custom else custom['color'])
+    border=3 if box else 1
+    outline=px(10) if box else px(3) if italic else CAPTION_OUTLINE
+    outline_color='&H20000000&' if box else '&H00000000&'
+    back='&H00000000&' if box else '&H80000000&'
+    shadow=0 if box else px(1 if italic else 2)
+    if 'background' in custom or (box and ('outline' in custom or 'outline_color' in custom)):
+        background=custom.get('background','#000000' if box else '')
+        border=4 if background else 1
+        back=(ass_color(background) if 'background' in custom else '&H20000000&') if background else '&HFF000000&'
+        shadow=(px(10) if box else px(4)) if background else 0
+        if box:
+            outline,outline_color=0,'&H00000000&'
+    outline=custom.get('outline',outline)
+    if 'outline_color' in custom:
+        outline_color=ass_color(custom['outline_color'])
+    size=custom.get('size',CUE_SIZES[look])
+    return f'Style: {name},{family},{size},{color},&H000000FF&,{outline_color},{back},{bold},{-italic},0,0,100,100,0,0,{border},{outline},{shadow},2,0,0,0,1'
+
+
 def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layout='band',offsets=None):
     """Build the ASS subtitle file (headline + narration captions) and the matching SRT text."""
     shift={k:px((offsets or {}).get(k) or 0) for k in OFFSETS}
@@ -676,10 +1152,9 @@ def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layo
     ass=['[Script Info]','ScriptType: v4.00+',f'PlayResX: {WIDTH}',f'PlayResY: {HEIGHT}','WrapStyle: 2','ScaledBorderAndShadow: yes','',
          '[V4+ Styles]','Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
          f'Style: Title,{title_family},{size},{ass_color(style["title"])},&H000000FF&,&H00000000&,&H00000000&,{title_bold},0,0,0,100,100,0,0,1,{TITLE_OUTLINE},0,2,0,0,0,1',
-         f'Style: Caption,{caption_family},{CAPTION_FONT},{ass_color(style["caption"])},&H000000FF&,&H00000000&,&H80000000&,{caption_bold},0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},{px(2)},2,0,0,0,1',
-         f'Style: CaptionBox,{caption_family},{px(40)},{ass_color(style["caption"])},&H000000FF&,&H20000000&,&H00000000&,{caption_bold},0,0,0,100,100,0,0,3,{px(10)},0,2,0,0,0,1',
-         f'Style: CaptionAccent,{caption_family},{CAPTION_FONT},{ass_color(CUE_ACCENT)},&H000000FF&,&H00000000&,&H80000000&,{caption_bold},0,0,0,100,100,0,0,1,{CAPTION_OUTLINE},{px(2)},2,0,0,0,1',
-         f'Style: Lyric,{caption_family},{px(32)},&H00FFFFFF&,&H000000FF&,&H00000000&,&H80000000&,0,-1,0,0,100,100,0,0,1,{px(3)},{px(1)},2,0,0,0,1',
+         *(cue_ass_style(name,look,style,caption_family,caption_bold,{}) for look,name in CUE_LOOKS.items()),
+         *(cue_ass_style(f'Cue{i}',cue['look'],style,caption_family,caption_bold,cue['style'])
+           for i,cue in enumerate(doc.get('cues',[])) if cue.get('style')),
          f'Style: Credit,{ui_family},{CREDIT_FONT},&H00D8D8D8&,&H000000FF&,&H00000000&,&H00000000&,0,0,0,0,100,100,0,0,1,{px(1)},0,2,0,0,0,1',
          f'Style: Card,{ui_family},20,&H00FFFFFF&,&H000000FF&,&H00000000&,&H60000000&,0,0,0,0,100,100,0,0,1,0,{px(3)},7,0,0,0,1',
          f'Style: CommentName,{ui_family},{COMMENT_NAME_FONT},&H00707070&,&H000000FF&,&H00000000&,&H00000000&,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
@@ -688,13 +1163,32 @@ def subtitles(doc,style,duration,captions,title_font=None,caption_font=None,layo
          f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Title,,0,0,0,,{{\\pos({WIDTH//2},{title_bottom+shift["title_y"]})}}{title}']
     if credit:ass.append(f'Dialogue: 0,{ass_time(0)},{ass_time(duration+1)},Credit,,0,0,0,,{{\\pos({WIDTH//2},{TITLE_HEIGHT-px(12)+shift["credit_y"]})}}{ass_text(credit)}')
     ass.extend(comment_events(doc.get('comments') or [],layout,duration,shift['comment_y']))
+    ass.extend(overlay_events(doc.get('overlays',[]),duration))
+    for quote in doc.get('quotes',[]):
+        start,end=quote['start'],min(quote['end'] or duration,duration)
+        if end<=start or ass_time(end)==ass_time(start):
+            continue
+        size=min(54,960//len(quote['text']))
+        y=1515 if layout=='fill' else 1260
+        tags=rf'{{\an2\pos({WIDTH//2},{y})\fs{size}\c{ass_color("#ffe34a")}\bord5\shad0}}'
+        ass.append(f'Dialogue: 15,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{tags}{ass_text(quote["text"])}')
+    # Explicit timeline edits take precedence over automatic sentence captions.
     if doc.get('cues'):
         events,srt=cue_events(doc['cues'],style,layout,duration,shift['caption_y'])
         if captions:ass.extend(events)
         return '\n'.join(ass)+'\n',srt
-    srt=[];chunks=caption_chunks(doc['script'])
-    for index,chunk in enumerate(chunks):
-        start=duration*index/len(chunks);end=duration*(index+1)/len(chunks)
+    srt=[];events=[]
+    if doc.get('narration'):
+        for segment in doc['narration']['segments']:
+            chunks=caption_chunks(segment['text'])
+            for index,chunk in enumerate(chunks):
+                start=segment['start']+(segment['end']-segment['start'])*index/len(chunks)
+                end=segment['start']+(segment['end']-segment['start'])*(index+1)/len(chunks)
+                events.append((start,end,chunk))
+    else:
+        chunks=caption_chunks(doc['script'])
+        events=[(duration*index/len(chunks),duration*(index+1)/len(chunks),chunk) for index,chunk in enumerate(chunks)]
+    for index,(start,end,chunk) in enumerate(events):
         srt.extend([str(index+1),f'{srt_time(start)} --> {srt_time(end)}','\n'.join(' '.join(w for w,_ in line) for line in chunk),''])
         text=r'\N'.join(' '.join(('{\\c'+ass_color(style['highlight'])+'}'+ass_text(w)+'{\\c'+ass_color(style['caption'])+'}') if marked else ass_text(w) for w,marked in line) for line in chunk)
         if captions:ass.append(f'Dialogue: 0,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{{\\pos({WIDTH//2},{CAPTION_BOTTOM.get(layout,CAPTION_BOTTOM["band"])+shift["caption_y"]})}}{text}')
@@ -711,24 +1205,225 @@ def srt_time(seconds):
     return f'{hours:02}:{minutes:02}:{seconds:02},{ms:03}'
 
 
+def narration_qa_data(doc, plan):
+    """Describe the same caption chunks and source cuts used by the renderer."""
+    voice={**doc['narration'],'segments':[],'captions':[]}
+    for segment,cut in zip(doc['narration']['segments'],plan):
+        voice['segments'].append({**segment,'source_start':cut['source_start'],'source_end':cut['source_end']})
+        chunks=caption_chunks(segment['text'])
+        for index,chunk in enumerate(chunks):
+            start=segment['start']+segment['duration']*index/len(chunks)
+            end=segment['start']+segment['duration']*(index+1)/len(chunks)
+            voice['captions'].append({'sentence_id':segment['sentence_id'],'text':'\n'.join(' '.join(w for w,_ in line) for line in chunk),'start':start,'end':end})
+    if doc.get('cues'):
+        voice['captions']=[]
+        duration=doc['narration']['duration'];items=doc['cues']
+        for index,cue in enumerate(items):
+            start=min(cue['start'],duration)
+            end=min(cue['end'] or (items[index+1]['start'] if index+1<len(items) else duration),duration)
+            if end<=start:continue
+            text='\n'.join(' '.join(word for word,_ in line) for line in cue_lines(cue['text']))
+            if cue['sub']:text+='\n'+cue['sub']
+            voice['captions'].append({'text':text,'start':start,'end':end})
+    return voice
+
+
+def render_timeline(doc, voice):
+    cfg=doc['settings']
+    cuts=doc.get('clips') or []
+    if cuts:
+        return manual_timeline.duration(cuts), None, None
+    if voice:
+        import editing
+        import workflow
+        script=workflow.current_script(doc)
+        plan=editing.build_plan(doc['analysis'],script,voice,doc['source']['duration'])
+        return voice['duration'], plan, script
+    duration=min(cfg['duration'],doc['source']['duration']-cfg['start'])
+    if duration<=0:raise ValueError('시작 시간이 원본 길이보다 깁니다.')
+    return duration, None, None
+
+
+def media_graph(p, doc, source, plan, frame_filters=None):
+    cfg=doc['settings']
+    source_args=audio_mixer.input_args(source,SOURCE_FORMATS)
+    original=doc['source'].get('audio',False)
+    mix=doc.get('audio_mix') or doc.get('narration_id')
+    if plan:
+        import editing
+        graph=editing.ffmpeg_filters(plan,original,cfg['mute'],video_only=bool(mix))
+        if not mix:source_args+=audio_mixer.input_args(asset(p['id'],'narration'))
+    elif doc.get('clips'):
+        graph=manual_timeline.graph(doc['clips'],original and not cfg['mute'] and not mix,frame_filters)
+    else:
+        return ['-ss',str(cfg['start']),*source_args],None
+    return source_args,graph
+
+
+def legacy_narration(p, doc, duration):
+    ident=doc['narration_id']
+    if not isinstance(ident,str) or not re.fullmatch('[a-f0-9]{32}',ident):
+        raise ValueError('기존 나레이션을 찾을 수 없습니다.')
+    with CONNECT() as con:
+        table=con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='narrations'").fetchone()
+        row=con.execute("SELECT signature,data FROM narrations WHERE id=? AND project_id=? AND status='ready'",
+                        (ident,p['id'])).fetchone() if table else None
+    cfg=doc['settings']
+    signature=hashlib.sha256(json.dumps({'script':doc['script'],'source':doc['source'],
+        'start':cfg['start'],'duration':cfg['duration']},sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+    if not row or row['signature']!=signature or doc.get('clips'):
+        raise ValueError('기존 나레이션이 현재 원본·구간·대본과 일치하지 않습니다.')
+    data=json.loads(row['data'])
+    length=data.get('duration')
+    root=(PROJECT_ROOT/p['id']).resolve()
+    path=(root/'narration'/ident/'voice.wav').resolve()
+    if not path.is_relative_to(root) or not path.is_file() or not isinstance(length,(int,float)) or not 0<length<=duration:
+        raise ValueError('기존 나레이션 파일이나 길이를 확인하세요.')
+    with path.open('rb') as stream:
+        if hashlib.file_digest(stream,'sha256').hexdigest()!=data.get('sha256'):
+            raise ValueError('기존 나레이션 파일이 변경되었습니다.')
+    return path,length
+
+
+def render_mix(p, doc, source, duration, plan, output):
+    mix=doc.get('audio_mix')
+    legacy=doc.get('narration_id') and not uploaded_voice(doc)
+    if legacy and not mix:mix=audio_mixer.settings({'source_volume':0},audio_directory(p))
+    if not mix:return None
+    if plan:
+        cuts=[(cut['source_start'],cut['source_end'],cut['duration']) for cut in plan]
+    elif doc.get('clips'):
+        cuts=[(cut['start'],cut['end'],cut['end']-cut['start']) for cut in doc['clips']]
+    else:
+        start=doc['settings']['start']
+        cuts=[(start,start+duration,duration)]
+    generated=(asset(p['id'],'narration'),duration) if plan else legacy_narration(p,doc,duration) if legacy else None
+    audio_mixer.render(output,source,SOURCE_FORMATS,cuts,duration,mix,
+                       doc['source'].get('audio',False) and not doc['settings']['mute'],
+                       audio_directory(p),generated,duck_generated_source=bool(plan))
+    return output
+
+
+def check_rendered_narration(p, report, duration, scratch):
+    """Inspect the narration contribution in isolation from the other audio tracks."""
+    import qa
+
+    doc=p['document']
+    track=(doc.get('audio_mix') or {}).get('narration',{})
+    volume=track.get('volume',100)
+    metrics={}
+    if track.get('muted') or not volume:
+        reason='나레이션 트랙이 음소거됐거나 볼륨이 0입니다.'
+    else:
+        reason='내보낸 영상 구간에 들리는 나레이션 신호가 없습니다.'
+        try:
+            source=asset(p['id'],'narration')
+            clip={'in':0,'out':doc['narration']['duration'],'at':0}
+            filters=audio_mixer.placed_audio(clip,duration)+f',volume={volume / 100}'
+            subprocess.run([*audio_mixer.COMMAND,'-loglevel','error',*audio_mixer.input_args(source),
+                            '-map','0:a:0','-af',filters,'-c:a','pcm_s16le',str(scratch)],
+                           capture_output=True,check=True,timeout=60)
+            metrics=qa.audio_stats(scratch)
+        except (OSError, ValueError, EOFError, subprocess.SubprocessError):
+            reason='최종 믹스에 사용된 나레이션 신호를 확인하지 못했습니다.'
+        finally:
+            scratch.unlink(missing_ok=True)
+    present=metrics.get('peak',0)>0
+    report['checks'].append({'name':'narration_presence','status':'passed' if present else 'failed',
+                             'metrics':metrics})
+    if not present:
+        report['issues'].append({'code':'narration_not_audible','severity':'error','message':reason})
+        report['passed']=False
+
+
+def mapped_mix(args, mix):
+    if not mix:return args,[]
+    index=args.count('-i')
+    return [*args,'-i',str(mix)],['-map',f'{index}:a:0']
+
+
+def preview_mix(data):
+    p=project(str(data.get('id','')))
+    doc=p['document']
+    if not doc.get('source'):raise ValueError('원본 영상을 먼저 업로드하세요.')
+    voice=current_voice(doc) if data.get('script',doc['script'])==doc['script'] else None
+    changes=data.get('settings',{})
+    if not isinstance(changes,dict):raise ValueError('미리보기 설정을 확인하세요.')
+    doc['settings']=settings({**doc['settings'],**changes})
+    doc['clips']=manual_timeline.clips(data.get('clips',doc.get('clips',[])),doc['source']['duration'])
+    if 'audio_mix' in data:
+        doc['audio_mix']=audio_mixer.settings(data['audio_mix'],audio_directory(p)) if data['audio_mix'] is not None else None
+    if doc['clips'] or uploaded_voice(doc):voice=None
+    duration,plan,_=render_timeline(doc,voice)
+    source=PROJECT_ROOT/p['id']/doc['source']['filename']
+    with tempfile.TemporaryDirectory() as folder:
+        output=Path(folder)/'preview.mp4'
+        try:
+            mix=render_mix(p,doc,source,duration,plan,Path(folder)/'mix.wav')
+            cfg=doc['settings']
+            frame_filters=None
+            if doc['clips']:
+                def frame_filters(cut):
+                    return clip_layout_filters(cfg,cut)+['format=yuv420p']
+            args,graph=media_graph(p,doc,source,plan,frame_filters)
+            args,maps=mapped_mix(args,mix)
+            picture="scale=w='min(480,iw)':h=-2,setsar=1"
+            if cfg['mirror'] and not frame_filters:picture+=',hflip'
+            if graph:
+                filters=graph['filters']+[f'[{graph["video_label"]}]{picture}[preview_video]']
+                args+=['-filter_complex_threads','2','-filter_complex',';'.join(filters),'-map','[preview_video]']
+                if graph['audio_label']:maps=['-map',f'[{graph["audio_label"]}]']
+            else:
+                args+=['-map','0:v:0','-vf',picture]
+                if not mix and not doc['settings']['mute']:maps=['-map','0:a:0?']
+            subprocess.run(
+                [*audio_mixer.COMMAND,'-loglevel','error','-threads','2',*args,*maps,'-t',str(duration),
+                 '-c:v','libx264','-preset','ultrafast','-crf','28','-threads','2','-pix_fmt','yuv420p',
+                 '-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)],
+                capture_output=True,check=True,timeout=120,
+            )
+        except (OSError,subprocess.SubprocessError):
+            raise ValueError('오디오 미리보기를 만들 수 없습니다. 파일과 재생 구간을 확인하세요.') from None
+        return output.read_bytes()
+
+
 def render(p):
     doc=p['document'];directory=PROJECT_ROOT/p['id'];run=directory/uuid.uuid4().hex
     try:
         run.mkdir(parents=True)
-        source=directory/doc['source']['filename'];cfg=doc['settings'];duration=min(cfg['duration'],doc['source']['duration']-cfg['start'])
-        from narration import for_render,timing
-        voice=for_render(p)
+        source=directory/doc['source']['filename'];cfg=doc['settings'];cuts=doc.get('clips') or []
+        voice=doc.get('narration') if not cuts and not uploaded_voice(doc) else None
+        if voice and voice.get('approved_hash') != doc.get('approved_hash'):raise ValueError('stale narration')
+        duration,plan,script=render_timeline(doc,voice)
+        mix=render_mix(p,doc,source,duration,plan,run/'mix.wav')
         style=STYLES[cfg['style']]
         vf=layout_filters(cfg.get('layout','fill'))
         if cfg['mirror']:vf.append('hflip')
         boxes=doc.get('blurs') or [];letters=[b for b in boxes if b.get('mode')=='text'];ai=[b for b in boxes if b.get('mode')=='ai']
-        source_args=['-ss',str(cfg['start']),'-format_whitelist',SOURCE_FORMATS,'-protocol_whitelist','file','-i',str(source)]
+        source_args,graph=media_graph(p,doc,source,plan,lambda cut:clip_layout_filters(cfg,cut)+['format=yuv420p'])
+        graph_args=source_args
+        if cuts:vf=['null']
+        graph_audio=['-map',f'[{graph["audio_label"]}]'] if graph and graph['audio_label'] else []
         if ai or letters:
             # These erasers work on the laid-out video outside FFmpeg; their result replaces the source picture.
             picture=None
+            if graph:
+                # Match scenes before erasing: box coordinates/times refer to the final
+                # canvas and spoken timeline, not a contiguous slice of the source.
+                laid=run/'matched-laid.mp4'
+                filters=graph['filters']+[f'[{graph["video_label"]}]'+','.join(vf)+'[laid_video]']
+                subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y',*graph_args,
+                                '-filter_complex_threads','2','-filter_complex',';'.join(filters),'-t',str(duration),
+                                '-map','[laid_video]',*graph_audio,
+                                '-c:v','libx264','-preset','veryfast','-crf','14','-pix_fmt','yuv420p',
+                                '-c:a','aac','-b:a','192k',str(laid)],capture_output=True,timeout=900,check=True)
+                picture=laid
+                source_args=['-i',str(laid)]  # Preserve its scene-matched, ducked audio.
             if ai:
-                laid=run/'laid.mp4'
-                subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y',*source_args,'-t',str(duration),'-map','0:v:0','-an','-vf',','.join(vf+['fps=30']) ,'-c:v','libx264','-preset','veryfast','-crf','14','-pix_fmt','yuv420p',str(laid)],capture_output=True,timeout=900,check=True)
+                if picture is None:
+                    laid=run/'laid.mp4'
+                    subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y',*source_args,'-t',str(duration),'-map','0:v:0','-an','-vf',','.join(vf+['fps=30']) ,'-c:v','libx264','-preset','veryfast','-crf','14','-pix_fmt','yuv420p',str(laid)],capture_output=True,timeout=900,check=True)
+                else:laid=picture
                 picture=run/'ai.mp4';erase_ai(laid,picture,ai,run/'ai_eraser.log')
             if letters:
                 cleaned=run/'cleaned.mp4'
@@ -736,32 +1431,87 @@ def render(p):
                 else:erase_letters({'mode':'video','source':str(source),'start':cfg['start'],'duration':duration,'chain':','.join(vf),'boxes':letters,'output':str(cleaned)})
                 picture=cleaned
             vf=[];source_args=['-i',str(picture)]+source_args
-        vf=[blur_graph(','.join(vf) or 'null',[b for b in boxes if b.get('mode') not in PRE_MODES],duration)]
+        vf=[blur_graph(','.join(vf) or 'null',[b for b in boxes if b.get('mode') not in PRE_MODES],duration,prefix='overlay_')]
         # libass loads the font from its own folder, so it does not depend on the system font setup (fontconfig on Windows).
         title_font=font_path(cfg.get('title_font',''));caption_font=font_path(cfg.get('caption_font',''))
         fonts=run/'fonts';fonts.mkdir()
-        for path in {title_font,caption_font,Path(FONT)}:shutil.copyfile(path,fonts/path.name)
-        ass,srt=subtitles(doc,style,duration,cfg['captions'],title_font,caption_font,cfg.get('layout','fill'),cfg)
+        overlay_fonts={font_path(item['font']) for item in doc.get('overlays',[])}
+        overlay_fonts.update(font_path(cue['style']['font']) for cue in doc.get('cues',[]) if 'font' in cue.get('style',{}))
+        for path in {title_font,caption_font,Path(FONT)} | overlay_fonts:
+            shutil.copyfile(path,fonts/path.name)
+        caption_doc={**doc,'narration':None} if uploaded_voice(doc) else doc
+        ass,srt=subtitles(caption_doc,style,duration,cfg['captions'],title_font,caption_font,cfg.get('layout','fill'),cfg)
         (run/'overlay.ass').write_text(ass,encoding='utf-8')
         vf.extend([f'drawbox=x=0:y=0:w=iw:h={TITLE_HEIGHT}:color=black:t=fill',f"ass=filename={filter_path(run/'overlay.ass')}:fontsdir={filter_path(fonts)}"])
         (run/'captions.srt').write_text(srt,encoding='utf-8')
         output=run/'short.mp4'
-        audio=1 if letters or ai else 0
-        command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args]
-        if voice:command+=['-protocol_whitelist','file','-i',str(voice[0])]
-        command+=['-t',str(duration),'-map','0:v:0']
-        if voice:command+=['-map',f'{audio+1}:a:0','-af','apad']
-        elif not cfg['mute']:command+=['-map',f'{audio}:a:0?']
-        command+=['-vf',','.join(vf),'-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
+        if graph and not (ai or letters):
+            graph_args,mix_map=mapped_mix(graph_args,mix)
+            filters=graph['filters']+[f'[{graph["video_label"]}]'+','.join(vf)+'[finished_video]']
+            command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*graph_args,'-filter_complex_threads','2','-filter_complex',';'.join(filters),'-t',str(duration),'-map','[finished_video]',*graph_audio,*mix_map]
+        else:
+            audio=1 if letters or ai else 0
+            source_args,mix_map=mapped_mix(source_args,mix)
+            command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args,'-t',str(duration),'-map','0:v:0']
+            if mix:command+=mix_map
+            elif voice or not cfg['mute']:command+=['-map',f'{audio}:a:0?']
+            command+=['-vf',','.join(vf)]
+        command+=['-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
         subprocess.run(command,capture_output=True,timeout=480,check=True)
+        if mix:mix.unlink()
         result=probe(output)
         if result['width']!=WIDTH or result['height']!=HEIGHT:raise ValueError('render size')
-        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':timing(p,voice[1]) if voice else ('manual timeline' if doc.get('cues') else 'equal segments; not speech aligned'),'narration':({'id':voice[1]['id'],'mode':voice[1]['mode'],'timing':voice[1]['data']['timing'],'duration':voice[1]['data']['duration']} if voice else 'original audio or mute'),'blurs':doc.get('blurs') or [],'approved_hash':doc['approved_hash']}
+        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'manual timeline' if doc.get('cues') else 'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','blurs':doc.get('blurs') or [],'cues':doc.get('cues') or [],'credit':doc.get('credit',''),'credit_on':doc.get('credit_on',True),'approved_hash':doc['approved_hash']}
+        archive_files=['short.mp4','captions.srt','project.json']
+        if bundle:=doc.get('shorts_bundle'):
+            with CONNECT() as con:
+                channel=con.execute('SELECT name FROM production_channels WHERE id=?',(p['channel_id'],)).fetchone()
+            posting={**bundle,'title':p['title'],'channel':channel['name'] if channel else p['channel_id']}
+            manifest['posting']=posting
+            (run/'posting.txt').write_text(
+                f"채널: {posting['channel']}\n제목: {posting['title']}\n\n{posting['description']}\n",encoding='utf-8')
+            archive_files.append('posting.txt')
+        manifest['overlays']=doc.get('overlays',[])
+        if mix:manifest['audio_mix']=doc['audio_mix']
+        if uploaded_voice(doc):manifest['narration']='uploaded audio'
+        elif doc.get('narration_id'):manifest['narration']='legacy selected audio'
+        if cuts:manifest['clips']=cuts
+        if doc.get('quotes'):manifest['quotes']=doc['quotes']
+        if voice:
+            import qa
+            mixed_audio=run/'mixed-audio.wav'
+            subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-i',str(output),'-vn','-c:a','pcm_s16le',str(mixed_audio)],capture_output=True,timeout=60,check=True)
+            report=qa.check_report(doc['analysis'],{**script,'approved':True},narration_qa_data(doc,plan),mixed_audio)
+            check_rendered_narration(p,report,min(duration,result['duration']),run/'narration-check.wav')
+            report['audio_scope']='rendered_mix'
+            with output.open('rb') as video:
+                report['output_sha256']=hashlib.file_digest(video,'sha256').hexdigest()
+            doc['qa_report']=report
+            manifest.update(version=2,analysis=doc['analysis'],generated_script=script,narration=voice,edit_plan=plan,caption_timing='manual timeline' if doc.get('cues') else 'measured sentence WAV duration; chunks within sentence',qa_report=report)
+            (run/'qa-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+            archive_files.append('qa-report.json')
+            mixed_audio.unlink()
+        if bundle_voice:=doc.get('bundle_narration'):
+            import qa
+            track=doc['audio_mix']['narration']
+            if track['muted'] or not track['volume'] or track['clip']['id']!=bundle_voice['clip_id']:
+                raise ToolError('최종 영상에 자동 나레이션 트랙을 넣을 수 없습니다.')
+            mixed_audio=run/'bundle-final.wav'
+            subprocess.run(['ffmpeg','-v','error','-nostdin','-y','-i',str(output),
+                            '-map','0:a:0','-c:a','pcm_s16le',str(mixed_audio)],
+                           capture_output=True,check=True,timeout=60)
+            stats=qa.audio_stats(mixed_audio)
+            mixed_audio.unlink()
+            if not stats['peak'] or stats['clipped_samples']:
+                raise ToolError('최종 MP4 오디오가 무음이거나 클리핑됐습니다.')
+            manifest.update(narration=bundle_voice,caption_timing='measured sentence WAV duration',
+                            bundle_audio_qa=stats)
         (run/'project.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
         with zipfile.ZipFile(run/'project.zip','w',compression=zipfile.ZIP_STORED) as archive:
-            for name in ('short.mp4','captions.srt','project.json'):archive.write(run/name,name)
-            if voice:archive.write(voice[0],'narration.wav')
-        doc.update({'output':str(output.relative_to(directory)),'archive':str((run/'project.zip').relative_to(directory)),'message':'MP4와 자막·프로젝트 설정 묶음 제작이 완료되었습니다. 선택한 원음·무음·내레이션 설정이 적용됐습니다.','render_info':result})
+            for name in archive_files:archive.write(run/name,name)
+        doc.update({'output':str(output.relative_to(directory)),'archive':str((run/'project.zip').relative_to(directory)),'message':'MP4와 자막·프로젝트 설정 묶음 제작이 완료되었습니다. 원음 유지 방식이며 합성 음성은 없습니다.','render_info':result})
+        if voice:doc['message']='음성 길이에 맞춘 장면·자막과 원음 덕킹을 렌더링했습니다. QA 리포트를 확인하세요.'+(' 모의 음성은 무음입니다.' if voice['mock'] else '')
+        if bundle_voice:doc['message']='채널 나레이션과 음성 타이밍에 맞춘 자막을 렌더링했습니다.'
         shutil.rmtree(fonts,ignore_errors=True)
         p['status']='completed';store(p)
     except Exception as exc:
@@ -782,9 +1532,27 @@ def font_file(name):
 def asset(project_id,kind):
     p=project(project_id);doc=p['document'];directory=(PROJECT_ROOT/p['id']).resolve()
     if kind=='source':relative=(doc.get('source') or {}).get('filename')
+    elif kind=='analysis':relative='analysis.json' if doc.get('analysis') else None
+    elif kind=='narration':relative=(doc.get('narration') or {}).get('audio_file')
     elif kind in ('output','archive'):relative=doc.get(kind) if p['status']=='completed' else None
     else:relative=None
     if not relative:raise ValueError('파일이 아직 준비되지 않았습니다.')
     path=(directory/relative).resolve()
     if not path.is_relative_to(directory) or not path.is_file():raise ValueError('파일을 찾을 수 없습니다.')
     return path
+
+
+def waveform(project_id,kind,start,duration):
+    import waveforms
+    if kind in ('source','narration'):
+        path=asset(project_id,kind)
+        formats=SOURCE_FORMATS if kind=='source' else 'wav'
+    elif re.fullmatch(r'[0-9a-f]{32}',kind):
+        directory=audio_directory(project(project_id)).resolve()
+        path=(directory/(kind+'.audio')).resolve()
+        if not path.is_relative_to(directory) or not path.is_file():
+            raise ValueError('오디오 파일을 찾을 수 없습니다.')
+        formats=audio_mixer.FORMATS
+    else:
+        raise ValueError('파형을 표시할 오디오를 선택하세요.')
+    return waveforms.peaks(path,formats,start,duration)

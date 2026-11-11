@@ -1,159 +1,263 @@
-"""Approved-script narration, measured sentence cues, and explicit activation."""
-import hashlib,json,math,os,re,subprocess,threading,time,uuid,wave,textwrap,contextlib
+"""Replaceable Korean TTS engines and measured, sentence-aligned PCM audio.
+
+The default engine deliberately produces silence, not synthesized speech. Set
+MFLOW_TTS_ENGINE=sapi to explicitly use an installed Windows Korean SAPI voice.
+OpenAI speech requires an explicit engine selection and a server API key.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
 from pathlib import Path
-import urllib.request,urllib.error
-import production
-LOCK=threading.Lock()
-
-def init():
- with production.CONNECT() as con:con.execute('CREATE TABLE IF NOT EXISTS narrations (id TEXT PRIMARY KEY,project_id TEXT,signature TEXT,status TEXT,mode TEXT,message TEXT,data TEXT,updated_at TEXT)')
-
-def signature(doc):
- if not doc.get('source') or not doc.get('script'):raise ValueError('원본과 대본을 먼저 준비하세요.')
- return hashlib.sha256(json.dumps({'script':doc['script'],'source':doc['source'],'start':doc['settings']['start'],'duration':doc['settings']['duration']},sort_keys=True,ensure_ascii=False).encode()).hexdigest()
-
-def approved(project_id):
- p=production.project(project_id)
- if p['status']=='rendering' or p['document'].get('approved_hash')!=production.fingerprint(p['document']):raise ValueError('현재 대본·설정을 먼저 승인하세요.')
- signature(p['document']);return p
-
-def get(ident):
- with production.CONNECT() as con:r=con.execute('SELECT * FROM narrations WHERE id=?',(ident,)).fetchone()
- if not r:raise ValueError('내레이션을 찾을 수 없습니다.')
- a=dict(r);a['data']=json.loads(a['data']);return a
-
-def folder(a):return production.PROJECT_ROOT/a['project_id']/'narration'/a['id']
-def store(a,status,message):
- with production.CONNECT() as con:con.execute('UPDATE narrations SET status=?,message=?,data=?,updated_at=? WHERE id=?',(status,message,json.dumps(a['data'],ensure_ascii=False),production.now(),a['id']))
-
-def state(project_id):
- p=production.project(project_id)
- with production.CONNECT() as con:r=con.execute('SELECT id FROM narrations WHERE project_id=? ORDER BY rowid DESC LIMIT 1',(project_id,)).fetchone()
- a=get(r[0]) if r else None
- if a:
-  try:a['stale']=a['signature']!=signature(p['document'])
-  except ValueError:a['stale']=True
- return {'narration':a,'selected':p['document'].get('narration_id'),'ai_configured':bool(os.environ.get('MFLOW_AI_KEY'))}
-
-def probe(path):
- try:
-  result=subprocess.run(['ffprobe','-v','error','-format_whitelist','wav,mp3,mov,mp4,m4a,ogg,flac','-protocol_whitelist','file','-show_format','-show_streams','-of','json',str(path)],capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=15,check=True)
-  info=json.loads(result.stdout);seconds=float(info['format']['duration'])
-  if not math.isfinite(seconds) or not 0<seconds<=120 or not any(s['codec_type']=='audio' for s in info['streams']) or any(s['codec_type']=='video' for s in info['streams']):raise ValueError('audio')
-  return seconds
- except (OSError,ValueError,KeyError,subprocess.SubprocessError):raise ValueError('120초 이하의 유효한 WAV/MP3/M4A/OGG/FLAC 음성을 선택하세요.') from None
-
-def normalize(source,destination):
- probe(source)
- subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-format_whitelist','wav,mp3,mov,mp4,m4a,ogg,flac','-protocol_whitelist','file','-i',str(source),'-vn','-ac','1','-ar','24000','-c:a','pcm_s16le',str(destination)],capture_output=True,check=True,timeout=30)
- return probe(destination)
-
-def chunks(script,limit=20):
- result=[' '.join(word for line in group for word,highlight in line) for group in production.caption_chunks(script)]
- if not 1<=len(result)<=limit:raise ValueError(f'음성 자막은 최대 {limit}개 구간입니다. 대본을 간결하게 정리하세요.')
- return result
+import subprocess
+import tempfile
+from typing import Protocol
+import urllib.error
+import urllib.request
+import wave
 
 
-def create(p,mode):
- ident=uuid.uuid4().hex
- with production.CONNECT() as con:con.execute('INSERT INTO narrations VALUES (?,?,?,?,?,?,?,?)',(ident,p['id'],signature(p['document']),'preparing',mode,'음성을 준비합니다.','{}',production.now()))
- a=get(ident);folder(a).mkdir(parents=True,exist_ok=True);return a
+class TTSEngine(Protocol):
+    name: str
+    mock: bool
 
-def upload(project_id,reader,size):
- p=approved(project_id)
- if not 0<size<=20*1024*1024:raise ValueError('음성 파일은 20MB 이하입니다.')
- if not LOCK.acquire(blocking=False):raise ValueError('다른 음성 작업이 진행 중입니다.')
- a=None
- try:
-  a=create(p,'upload');source=folder(a)/'original.audio'
-  with source.open('xb') as file:
-   remaining=size
-   while remaining:
-    b=reader.read(min(1024*1024,remaining))
-    if not b:raise ValueError('음성 업로드가 중단되었습니다.')
-    file.write(b);remaining-=len(b)
-  seconds=normalize(source,folder(a)/'voice.wav');parts=chunks(p['document']['script'],40)
-  a['data']={'duration':seconds,'timing':'manual_estimate','cues':[{'text':t,'start':round(seconds*i/len(parts),3),'end':round(seconds*(i+1)/len(parts),3)} for i,t in enumerate(parts)],'sha256':hashlib.sha256((folder(a)/'voice.wav').read_bytes()).hexdigest()}
-  store(a,'ready','음성 업로드 완료. 자막 시각은 예상 균등 배치입니다. 들으면서 수정·확인하세요.')
-  return a['id']
- except Exception as e:
-  if a:
-   store(a,'error',str(e) if isinstance(e,ValueError) else '음성을 변환하지 못했습니다.')
-   for path in folder(a).glob('*'):
-    if path.is_file():path.unlink(missing_ok=True)
-  raise ValueError(str(e) if isinstance(e,ValueError) else '음성을 변환하지 못했습니다.') from None
- finally:LOCK.release()
+    def synthesize(self, text: str, output_path: Path) -> None:
+        """Write one sentence as an uncompressed PCM WAV file."""
+        ...
 
-def start(project_id):
- p=approved(project_id)
- if not os.environ.get('MFLOW_AI_KEY'):raise ValueError('AI 음성에는 MFLOW_AI_KEY 등록이 필요합니다.')
- parts=chunks(p['document']['script'])
- if not LOCK.acquire(blocking=False):raise ValueError('다른 음성 작업이 진행 중입니다.')
- try:
-  a=create(p,'tts');threading.Thread(target=generate,args=(a,p,parts),daemon=True).start();return a['id']
- except Exception:LOCK.release();raise
 
-def speech(text):
- request=urllib.request.Request('https://api.openai.com/v1/audio/speech',data=json.dumps({'model':os.environ.get('MFLOW_TTS_MODEL','tts-1'),'voice':'alloy','input':text,'response_format':'wav'},ensure_ascii=False).encode(),headers={'Authorization':'Bearer '+os.environ['MFLOW_AI_KEY'],'Content-Type':'application/json'})
- try:
-  with urllib.request.urlopen(request,timeout=45) as response:body=response.read(10*1024*1024+1)
-  if len(body)>10*1024*1024:raise ValueError('음성 응답이 너무 큽니다.')
-  return body
- except (urllib.error.URLError,TimeoutError):raise ValueError('음성 API 연결에 실패했습니다. 키·할당량·api.openai.com 접근을 확인하세요.') from None
+class MockTTS:
+    """Deterministic silent test audio; durations are estimates until measured."""
 
-def generate(a,p,parts):
- try:
-  elapsed=0;data=[];started=time.monotonic();target=min(p['document']['settings']['duration'],p['document']['source']['duration']-p['document']['settings']['start']);pcm=[]
-  for i,text in enumerate(parts):
-   if time.monotonic()-started>180:raise ValueError('음성 생성 시간 제한을 초과했습니다.')
-   source=folder(a)/f'raw-{i}.wav';source.write_bytes(speech(text));dest=folder(a)/f'part-{i}.wav';seconds=normalize(source,dest)
-   if elapsed+seconds>target:raise ValueError('음성이 영상 구간보다 깁니다. 대본을 줄이거나 영상 길이를 늘린 후 다시 생성하세요.')
-   data.append({'text':text,'start':round(elapsed,3),'end':round(elapsed+seconds,3)});elapsed+=seconds
-   with wave.open(str(dest),'rb') as w:pcm.append(w.readframes(w.getnframes()))
-  with wave.open(str(folder(a)/'voice.wav'),'wb') as w:w.setnchannels(1);w.setsampwidth(2);w.setframerate(24000);w.writeframes(b''.join(pcm))
-  a['data']={'duration':probe(folder(a)/'voice.wav'),'timing':'measured_sentences','cues':data,'sha256':hashlib.sha256((folder(a)/'voice.wav').read_bytes()).hexdigest(),'voice':'alloy','model':os.environ.get('MFLOW_TTS_MODEL','tts-1')}
-  store(a,'ready','문장별 실제 음성 길이로 자막을 배치했습니다. 단어별 강제 정렬은 아닙니다. 들어보고 적용하세요.')
- except Exception as e:store(a,'error',str(e) if isinstance(e,ValueError) else '음성 생성 중 오류가 발생했습니다. 기존 대본·제작 음성은 유지됩니다.')
- finally:
-  for pattern in ('raw-*.wav','part-*.wav'):
-   for path in folder(a).glob(pattern):
-    with contextlib.suppress(OSError):path.unlink(missing_ok=True)
-  LOCK.release()
+    name = 'mock-silence'
+    mock = True
 
-def file(ident):
- a=get(ident)
- if a['status']!='ready':raise ValueError('완료된 음성이 없습니다.')
- path=folder(a)/'voice.wav'
- if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest()!=a['data']['sha256']:raise ValueError('음성 파일이 없거나 변경되었습니다.')
- return path
+    def synthesize(self, text: str, output_path: Path) -> None:
+        duration = max(0.4, len(''.join(text.split())) / 6.0)
+        with wave.open(str(output_path), 'wb') as audio:
+            audio.setparams((1, 2, 24000, 0, 'NONE', 'not compressed'))
+            audio.writeframes(b'\x00\x00' * round(duration * 24000))
 
-@production.serialized
-def activate(ident,cues,confirmed):
- a=get(ident);p=production.project(a['project_id']);doc=p['document']
- if confirmed is not True:raise ValueError('대본·음성·자막 시각 일치를 직접 확인하세요.')
- if p['status']=='rendering' or a['signature']!=signature(doc):raise ValueError('원본·대본·구간이 변경됐습니다. 현재 대본을 승인하고 새 음성을 준비하세요.')
- path=file(ident);target=min(doc['settings']['duration'],doc['source']['duration']-doc['settings']['start'])
- if a['data']['duration']>target:raise ValueError('음성이 영상 구간보다 깁니다. 잘라서 적용하지 않았습니다.')
- rows=production.cues(cues)
- if not rows:raise ValueError('음성에 맞는 자막 구간을 입력하세요.')
- previous=0
- for cue in rows:
-  if cue['start']<previous or cue['end']<=cue['start'] or cue['end']>a['data']['duration']+0.01:raise ValueError('자막은 겹치지 않고 음성 길이 안에 있어야 합니다.')
-  previous=cue['end']
- doc['narration_id']=ident;doc['cues']=rows;doc['approved_hash']=None;doc.pop('output',None);doc.pop('archive',None);p['status']='script_ready';doc['message']='내레이션과 자막을 적용했습니다. 렌더링 전 다시 승인하세요.';production.store(p)
 
-@production.serialized
-def disable(project_id):
- p=production.project(project_id)
- if p['status']=='rendering':raise ValueError('렌더링 중에는 음성을 바꿀 수 없습니다.')
- p['document'].pop('narration_id',None);p['document']['approved_hash']=None;p['document'].pop('output',None);p['document'].pop('archive',None);p['status']='script_ready' if p['document']['script'] else 'draft';production.store(p)
+class WindowsSAPI:
+    """Offline speech using a Korean voice installed on Windows.
 
-def for_render(p):
- ident=p['document'].get('narration_id')
- if not ident:return None
- a=get(ident)
- if a['project_id']!=p['id'] or a['signature']!=signature(p['document']):raise ValueError('선택한 내레이션이 이전 대본·원본용입니다. 새 음성을 준비하거나 선택 해제하세요.')
- return file(ident),a
+    Input text is read from a UTF-8 file, never interpolated as shell code.
+    A missing Korean voice is an error; we do not silently substitute a voice.
+    """
 
-def timing(p,a):
- return 'measured_sentences' if a['mode']=='tts' and p['document'].get('cues')==production.cues(a['data']['cues']) else 'manual_reviewed'
+    name = 'windows-sapi-ko-KR'
+    mock = False
+
+    def __init__(self, voice='', rate=0):
+        self.voice = voice
+        self.rate = rate
+
+    code = r'''
+param([string]$TextPath, [string]$AudioPath, [string]$VoiceName, [int]$Rate)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Speech
+$speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer
+try {
+    $voice = $speaker.GetInstalledVoices() | Where-Object {
+        $_.Enabled -and $_.VoiceInfo.Culture.Name -eq 'ko-KR' -and
+            (!$VoiceName -or $_.VoiceInfo.Name -eq $VoiceName)
+    } | Select-Object -First 1
+    if ($null -eq $voice) { throw 'Korean SAPI voice is not installed.' }
+    $speaker.SelectVoice($voice.VoiceInfo.Name)
+    $speaker.Rate = $Rate
+    $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(24000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)
+    $speaker.SetOutputToWaveFile($AudioPath, $format)
+    $speaker.Speak([System.IO.File]::ReadAllText($TextPath, [System.Text.Encoding]::UTF8))
+} finally { $speaker.Dispose() }
+'''
+
+    def synthesize(self, text: str, output_path: Path) -> None:
+        if os.name != 'nt':
+            raise ValueError('Windows 음성 엔진은 Windows에서만 사용할 수 있습니다.')
+        with tempfile.TemporaryDirectory(prefix='mflow-sapi-') as scratch:
+            folder = Path(scratch)
+            text_path, script_path = folder / 'text.txt', folder / 'speak.ps1'
+            text_path.write_text(text, encoding='utf-8')
+            script_path.write_text(self.code, encoding='utf-8-sig')
+            try:
+                result = subprocess.run(
+                    ['powershell.exe', '-NoProfile', '-NonInteractive',
+                     '-ExecutionPolicy', 'Bypass', '-File', str(script_path),
+                     '-TextPath', str(text_path), '-AudioPath', str(output_path.resolve()),
+                     '-VoiceName', self.voice, '-Rate', str(self.rate)],
+                    capture_output=True, timeout=90,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ValueError('Windows 한국어 음성 생성에 실패했습니다. 음성 설치 상태를 확인하세요.') from exc
+            if result.returncode or not output_path.is_file():
+                raise ValueError('선택한 엔진의 Windows 한국어 음성을 사용할 수 없습니다.')
+
+
+class WindowsOneCore(WindowsSAPI):
+    """Use installed Windows speech voices exposed through WinRT."""
+
+    name = 'windows-onecore-ko-KR'
+    code = r'''
+param([string]$TextPath, [string]$AudioPath, [string]$VoiceName, [int]$Rate)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Media.SpeechSynthesis.SpeechSynthesizer, Windows.Media.SpeechSynthesis, ContentType=WindowsRuntime]
+$resultType = [Windows.Media.SpeechSynthesis.SpeechSynthesisStream, Windows.Media.SpeechSynthesis, ContentType=WindowsRuntime]
+$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.IsGenericMethodDefinition -and
+    $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+} | Select-Object -First 1
+$voice = [Windows.Media.SpeechSynthesis.SpeechSynthesizer]::AllVoices | Where-Object {
+    $_.Language -eq 'ko-KR' -and (!$VoiceName -or $_.DisplayName -eq $VoiceName)
+} | Select-Object -First 1
+if ($null -eq $voice) { throw 'Korean OneCore voice is not installed.' }
+$speaker = New-Object Windows.Media.SpeechSynthesis.SpeechSynthesizer
+try {
+    $speaker.Voice = $voice
+    if ($Rate) { $speaker.Options.SpeakingRate = 1.0 + $Rate * 0.1 }
+    $text = [System.IO.File]::ReadAllText($TextPath, [System.Text.Encoding]::UTF8)
+    $operation = $speaker.SynthesizeTextToStreamAsync($text)
+    $task = $asTask.MakeGenericMethod($resultType).Invoke($null, @($operation))
+    $stream = $task.GetAwaiter().GetResult()
+    $inputStream = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($stream)
+    try {
+        $outputStream = [System.IO.File]::Create($AudioPath)
+        try { $inputStream.CopyTo($outputStream) }
+        finally { $outputStream.Dispose() }
+    } finally { $inputStream.Dispose() }
+} finally { $speaker.Dispose() }
+'''
+
+
+def openai_api_key():
+    return os.environ.get('MFLOW_AI_KEY') or os.environ.get('OPENAI_API_KEY')
+
+
+class OpenAITTS:
+    """Request WAV for each approved sentence; the caller measures the PCM."""
+
+    mock = False
+
+    def __init__(self):
+        if not openai_api_key():
+            raise ValueError('OpenAI 음성에는 서버 API 키 설정이 필요합니다.')
+        self.model = os.environ.get('MFLOW_TTS_MODEL', 'gpt-4o-mini-tts')
+        self.voice = os.environ.get('MFLOW_TTS_VOICE', 'alloy')
+        self.name = f'openai:{self.model}:{self.voice}'
+
+    def synthesize(self, text, output_path):
+        key = openai_api_key()
+        if not key:
+            raise ValueError('OpenAI 음성에는 서버 API 키 설정이 필요합니다.')
+        payload = {'model': self.model, 'voice': self.voice, 'input': text, 'response_format': 'wav'}
+        request = urllib.request.Request(
+            'https://api.openai.com/v1/audio/speech', data=json.dumps(payload, ensure_ascii=False).encode(),
+            headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'},
+        )
+        limit = 20 * 1024 * 1024
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                audio = response.read(limit + 1)
+        except (urllib.error.URLError, TimeoutError, ValueError):
+            raise ValueError('OpenAI 음성 요청에 실패했습니다. 키·할당량·네트워크 설정을 확인하세요.') from None
+        if len(audio) > limit:
+            raise ValueError('OpenAI 음성 응답이 최대 파일 크기를 초과했습니다.')
+        output_path.write_bytes(audio)
+
+
+def configured_engine(name=None) -> TTSEngine:
+    name = (name if name is not None else os.environ.get('MFLOW_TTS_ENGINE', 'mock')).strip().lower()
+    if name == 'mock':
+        return MockTTS()
+    if name == 'sapi':
+        return WindowsSAPI()
+    if name == 'onecore':
+        return WindowsOneCore()
+    if name == 'openai':
+        return OpenAITTS()
+    raise ValueError('MFLOW_TTS_ENGINE은 mock, sapi, onecore, openai 중 하나여야 합니다.')
+
+
+def script_fingerprint(script: dict) -> str:
+    """Bind generated audio to the exact approved sentence sequence."""
+    value = json.dumps(script.get('sentences'), ensure_ascii=False, sort_keys=True,
+                       separators=(',', ':'), allow_nan=False)
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
+def synthesize(script: dict, output_dir, engine: TTSEngine | None = None) -> dict:
+    """Generate and join sentence WAVs; all timings come from actual frame counts.
+
+    The caller owns approval authentication and should invalidate narration when
+    its project or script changes. This boundary also refuses unapproved scripts.
+    Existing output is replaced only after every sentence has been synthesized.
+    """
+    if not isinstance(script, dict) or script.get('approved') is not True:
+        raise ValueError('승인된 대본만 음성으로 만들 수 있습니다.')
+    sentences = script.get('sentences')
+    if not isinstance(sentences, list) or not 1 <= len(sentences) <= 200:
+        raise ValueError('대본에는 1~200개의 문장이 필요합니다.')
+    seen = set()
+    for sentence in sentences:
+        if not isinstance(sentence, dict):
+            raise ValueError('대본 문장 형식이 올바르지 않습니다.')
+        ident, scene_id, text = (sentence.get(key) for key in ('id', 'scene_id', 'text'))
+        if not isinstance(ident, str) or not ident.strip() or ident in seen:
+            raise ValueError('대본 문장 ID는 비어 있지 않고 고유해야 합니다.')
+        if not isinstance(scene_id, str) or not scene_id.strip():
+            raise ValueError('대본 문장에는 연결된 장면 ID가 필요합니다.')
+        if not isinstance(text, str) or not text.strip() or len(text) > 1000:
+            raise ValueError('각 나레이션 문장은 1~1000자여야 합니다.')
+        seen.add(ident)
+    engine = engine if engine is not None else configured_engine()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='tts-', dir=output_dir) as scratch:
+        staging = Path(scratch)
+        total_frames, format_key, segments = 0, None, []
+        joined = staging / 'narration.wav'
+        with wave.open(str(joined), 'wb') as combined:
+            # Keep error cleanup valid even when the first provider call fails.
+            combined.setparams((1, 2, 24000, 0, 'NONE', 'not compressed'))
+            for index, sentence in enumerate(sentences):
+                path = staging / f'{index:04d}.wav'
+                engine.synthesize(sentence['text'], path)
+                try:
+                    with wave.open(str(path), 'rb') as audio:
+                        key = (audio.getnchannels(), audio.getsampwidth(), audio.getframerate())
+                        frames = audio.getnframes()
+                        if audio.getcomptype() != 'NONE' or key[0] not in (1, 2) or key[1] not in (1, 2, 3, 4) or key[2] <= 0 or frames <= 0:
+                            raise ValueError('TTS 출력은 비어 있지 않은 PCM WAV여야 합니다.')
+                        if frames / key[2] > 180:
+                            raise ValueError('한 문장의 음성은 180초를 넘을 수 없습니다.')
+                        if format_key is None:
+                            format_key = key
+                            combined.setparams((*key, 0, 'NONE', 'not compressed'))
+                        elif format_key != key:
+                            raise ValueError('문장별 TTS 오디오 형식이 일치하지 않습니다.')
+                        pcm = audio.readframes(frames)
+                        if len(pcm) != frames * key[0] * key[1]:
+                            raise ValueError('TTS WAV 파일이 잘렸습니다.')
+                except (OSError, EOFError, wave.Error) as exc:
+                    raise ValueError('TTS 엔진이 유효한 PCM WAV를 만들지 못했습니다.') from exc
+                start = total_frames / key[2]
+                total_frames += frames
+                end = total_frames / key[2]
+                if not math.isfinite(end) or end > 600:
+                    raise ValueError('전체 나레이션은 600초를 넘을 수 없습니다.')
+                combined.writeframes(pcm)
+                segments.append({'sentence_id': sentence['id'], 'scene_id': sentence['scene_id'],
+                                 'text': sentence['text'], 'start': round(start, 6),
+                                 'end': round(end, 6), 'duration': round(frames / key[2], 6)})
+        result = {'engine': engine.name, 'mock': bool(engine.mock), 'audio_file': 'narration.wav',
+                  'duration': round(total_frames / format_key[2], 6), 'segments': segments,
+                  'script_fingerprint': script_fingerprint(script)}
+        manifest = staging / 'narration.json'
+        manifest.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+        joined.replace(output_dir / 'narration.wav')
+        manifest.replace(output_dir / 'narration.json')
+    return result

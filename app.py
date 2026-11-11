@@ -10,10 +10,16 @@ import uuid
 import shutil
 import mimetypes
 import production
-import scene_analysis
-import script_drafts
+import subtitle_translation
+import caption_drafts
+import reference_captions
+import shorts_bundle
+import publishing
+import shorts_performance
 import material_library
-import narration
+import scene_analysis
+import project_import
+import workflow
 import comment_picker
 import os
 import sqlite3
@@ -50,10 +56,10 @@ def connect():
 def init():
     with connect() as con: con.execute('PRAGMA journal_mode=WAL')
     production.init(connect)
-    scene_analysis.init()
-    script_drafts.init()
+    publishing.init()
+    shorts_performance.init()
     material_library.init()
-    narration.init()
+    scene_analysis.init()
     with connect() as con:
         con.executescript('''CREATE TABLE IF NOT EXISTS videos (
           id TEXT PRIMARY KEY, platform TEXT, title TEXT, channel TEXT, url TEXT,
@@ -335,6 +341,13 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self, value, status=200):
         body = json.dumps(value,ensure_ascii=False).encode()
         self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+    def send_png(self, body):
+        self.send_response(200)
+        self.send_header('Content-Type','image/png')
+        self.send_header('Content-Length',str(len(body)))
+        self.send_header('Cache-Control','no-store')
+        self.end_headers()
+        self.wfile.write(body)
     def local_request(self):
         # Blocks DNS-rebinding pages: the browser must address this server as localhost.
         host = urllib.parse.urlsplit('//'+(self.headers.get('Host') or '')).hostname
@@ -349,17 +362,8 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError,ConnectionResetError): pass
         except Exception as exc: self.fail(exc)
     def route_get(self):
-        if self.path.startswith('/api/narration/state?'):
-            query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query);return self.send_json(narration.state(query.get('id',[''])[0]))
-        if self.path.startswith('/api/narration/file?'):
-            query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            try:path=narration.file(query.get('id',[''])[0])
-            except ValueError:return self.send_error(404)
-            body=path.read_bytes();self.send_response(200);self.send_header('Content-Type','audio/wav');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body);return
-        if self.path == '/api/materials/state':return self.send_json(material_library.state())
-        if self.path.startswith('/api/scripts/state?'):
-            query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            return self.send_json(script_drafts.state(query.get('id',[''])[0]))
+        if self.path == '/api/materials/state':
+            return self.send_json(material_library.state())
         if self.path.startswith('/api/scenes/state?'):
             query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             return self.send_json(scene_analysis.state(query.get('id',[''])[0]))
@@ -367,8 +371,24 @@ class Handler(BaseHTTPRequestHandler):
             query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             try:path=scene_analysis.frame(query.get('id',[''])[0],int(query.get('index',['-1'])[0]))
             except ValueError:return self.send_error(404)
-            body=path.read_bytes();self.send_response(200);self.send_header('Content-Type','image/jpeg');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body);return
-        if self.path == '/api/production/state': return self.send_json(production.state())
+            body=path.read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type','image/jpeg')
+            self.send_header('Content-Length',str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == '/api/production/state':
+            return self.send_json({**production.state(),'publishing':publishing.snapshot(),
+                                   'shorts_performance':shorts_performance.snapshot(),
+                                   'ai_configured':scene_analysis.configured()})
+        if self.path == '/api/production/recovery': return self.send_json(production.recovery_drafts())
+        if self.path.startswith('/api/production/waveform?'):
+            query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                return self.send_json(production.waveform(*(query.get(key,[''])[0] for key in ('id','kind','start','duration'))))
+            except ValueError as exc:
+                return self.send_json({'error':str(exc)},400)
         if self.path.startswith('/api/production/font?'):
             query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             try: path=production.font_file(query.get('file',[''])[0])
@@ -379,7 +399,7 @@ class Handler(BaseHTTPRequestHandler):
             query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             try: body=production.preview_frame(query.get('id',[''])[0],query.get('t',['0'])[0])
             except ValueError as exc: return self.send_json({'error':str(exc)},400)
-            self.send_response(200);self.send_header('Content-Type','image/png');self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(body);return
+            return self.send_png(body)
         if self.path.startswith('/api/production/asset?'):
             query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             try: path=production.asset(query.get('id',[''])[0],query.get('kind',[''])[0])
@@ -395,13 +415,13 @@ class Handler(BaseHTTPRequestHandler):
                 if start>end or start>=size:
                     self.send_response(416);self.send_header('Content-Range',f'bytes */{size}');self.end_headers();return
                 status=206
-            mime='application/zip' if path.suffix=='.zip' else 'video/mp4'
+            mime={'.zip':'application/zip','.wav':'audio/wav','.json':'application/json; charset=utf-8'}.get(path.suffix,'video/mp4')
             if path.suffix=='.source':
                 with path.open('rb') as source_file:
                     if source_file.read(4)==b'\x1a\x45\xdf\xa3':mime='video/webm'
             self.send_response(status);self.send_header('Content-Type',mime);self.send_header('Accept-Ranges','bytes');self.send_header('Content-Length',str(end-start+1))
             if status==206:self.send_header('Content-Range',f'bytes {start}-{end}/{size}')
-            if query.get('download')==['1'] or path.suffix=='.zip':self.send_header('Content-Disposition','attachment; filename='+('project.zip' if path.suffix=='.zip' else 'short.mp4'))
+            if query.get('download')==['1'] or path.suffix=='.zip':self.send_header('Content-Disposition','attachment; filename='+{'.zip':'project.zip','.wav':'narration.wav','.json':'analysis.json'}.get(path.suffix,'short.mp4'))
             self.end_headers()
             try:
                 with path.open('rb') as file:
@@ -434,7 +454,8 @@ class Handler(BaseHTTPRequestHandler):
                 writer.writerow(["'"+str(c) if isinstance(c,str) and c.lstrip().startswith(('=','+','-','@')) else c for c in cells])
             body = ('\ufeff'+output.getvalue()).encode('utf-8')
             self.send_response(200); self.send_header('Content-Type','text/csv; charset=utf-8'); self.send_header('Content-Disposition','attachment; filename=mflow-videos.csv'); self.end_headers(); self.wfile.write(body); return
-        files = {'/':'index.html','/app.js':'app.js','/style.css':'style.css','/production.js':'production.js','/scene-analysis.js':'scene-analysis.js','/script-drafts.js':'script-drafts.js','/materials.js':'materials.js','/narration.js':'narration.js'}
+        files = {'/':'index.html','/app.js':'app.js','/style.css':'style.css','/production.js':'production.js',
+                 '/scene-analysis.js':'scene-analysis.js','/materials.js':'materials.js'}
         name = files.get(self.path)
         if not name: return self.send_error(404)
         body = (ROOT/'web'/name).read_bytes()
@@ -446,42 +467,119 @@ class Handler(BaseHTTPRequestHandler):
         if origin and urllib.parse.urlsplit(origin).netloc != self.headers.get('Host'): return self.send_json({'error':'허용되지 않은 요청입니다.'},403)
         try:
             length = int(self.headers.get('Content-Length','0'))
-            if self.path.startswith('/api/narration/upload?'):
-                query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query);return self.send_json({'id':narration.upload(query.get('id',[''])[0],self.rfile,length)})
             if self.path.startswith('/api/production/upload?'):
                 query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 info=production.upload(query.get('id',[''])[0],self.rfile,length)
                 return self.send_json({'message':'원본 영상을 업로드했습니다.','source':info})
-            if length < 0 or length > (131072 if self.path=='/api/scenes/review' else 32768 if self.path=='/api/materials/save' else 16384): raise ValueError('요청이 너무 큽니다.')
+            if self.path.startswith('/api/production/audio-upload?'):
+                query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                return self.send_json(production.upload_audio(query.get('id',[''])[0],self.rfile,length))
+            if urllib.parse.urlsplit(self.path).path == '/api/production/reference-captions':
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
+                region = reference_captions.parse_region(query.get('region', [None])[0])
+                self.connection.settimeout(30)
+                try:
+                    return self.send_json(reference_captions.recognize(self.rfile, length, region))
+                except TimeoutError:
+                    return self.send_json({'error':'참고 영상 업로드 시간이 초과됐습니다.'},408)
+            large_requests = ('/api/production/analysis','/api/production/recovery',
+                              '/api/production/update','/api/production/caption-drafts','/api/scenes/review',
+                              '/api/materials/save')
+            limit = 1024 * 1024 if self.path in large_requests else 16384
+            if length < 0 or length > limit: raise ValueError('요청이 너무 큽니다.')
             data = json.loads(self.rfile.read(length) or b'{}')
             if not isinstance(data,dict): raise ValueError('JSON 객체가 필요합니다.')
-            if self.path == '/api/narration/start':return self.send_json({'id':narration.start(str(data.get('project_id','')))},202)
-            if self.path == '/api/narration/activate':
-                narration.activate(str(data.get('id','')),data.get('cues'),data.get('confirmed'));return self.send_json({'message':'내레이션을 선택했습니다. 렌더링 전 다시 승인하세요.'})
-            if self.path == '/api/narration/disable':
-                narration.disable(str(data.get('project_id','')));return self.send_json({'message':'내레이션 선택을 해제했습니다. 원음/무음 설정으로 제작합니다.'})
-            if self.path == '/api/materials/collect':return self.send_json({'video_ids':material_library.collect(data.get('video_ids'),data.get('min_views',1000000),data.get('min_ratio',3))})
+            if self.path == '/api/materials/collect':
+                ids=material_library.collect(data.get('video_ids'),data.get('min_views',1000000),data.get('min_ratio',3))
+                return self.send_json({'video_ids':ids})
             if self.path == '/api/materials/save':
-                material_library.save(data);return self.send_json({'message':'소재 기획을 저장했습니다.'})
+                material_library.save(data)
+                return self.send_json({'message':'소재 기획을 저장했습니다.'})
             if self.path == '/api/materials/outcomes':
-                material_library.outcome(data);return self.send_json({'message':'재가공 버전의 성과를 기록했습니다.'})
-            if self.path == '/api/scripts/start':return self.send_json({'id':script_drafts.start(str(data.get('project_id','')),data.get('kind'))},202)
-            if self.path == '/api/scripts/save':
-                script_drafts.save(str(data.get('id','')),data.get('data'));return self.send_json({'message':'대본 초안 수정을 저장했습니다.'})
-            if self.path == '/api/scripts/apply':
-                script_drafts.apply(str(data.get('id','')),data.get('confirmed'));return self.send_json({'message':'제작에 반영했습니다. 렌더링 전 대본·설정을 승인하세요.'})
-            if self.path == '/api/scenes/start':return self.send_json({'id':scene_analysis.start(str(data.get('project_id','')),data.get('action'),data.get('interval',2))},202)
+                material_library.outcome(data)
+                return self.send_json({'message':'재가공 버전의 성과를 기록했습니다.'})
+            if self.path == '/api/scenes/start':
+                ident=scene_analysis.start(str(data.get('project_id','')),data.get('action'),data.get('interval',2))
+                return self.send_json({'id':ident},202)
             if self.path == '/api/scenes/review':
-                scene_analysis.review(str(data.get('project_id','')),data.get('segments'),data.get('transcript',''),data.get('confirmed',False));return self.send_json({'message':'분석 검토 내용을 저장했습니다.'})
+                scene_analysis.review(str(data.get('project_id','')),data.get('segments'),
+                                      data.get('transcript',''),data.get('confirmed',False))
+                return self.send_json({'message':'분석 검토 내용을 저장했습니다.'})
+            if self.path == '/api/scenes/apply':
+                return self.send_json(scene_analysis.apply_review(str(data.get('project_id',''))))
+            if self.path == '/api/production/generate-ai-script':
+                return self.send_json(scene_analysis.generate_ai_script(str(data.get('id',''))))
+            if self.path == '/api/production/recovery':
+                production.write_recovery_draft(data)
+                return self.send_json({'ok':True})
+            if self.path == '/api/production/translate-subtitles':
+                return self.send_json({'lines': subtitle_translation.translate(data)})
+            if self.path == '/api/production/caption-drafts':
+                return self.send_json({'lines': caption_drafts.build(data)})
+            if self.path == '/api/production/frame':
+                return self.send_png(production.preview_frame(str(data.get('id','')),data.get('t',0),data))
+            if self.path == '/api/production/mix-preview':
+                body=production.preview_mix(data)
+                self.send_response(200)
+                self.send_header('Content-Type','video/mp4')
+                self.send_header('Content-Length',str(len(body)))
+                self.send_header('Cache-Control','no-store')
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path == '/api/production/channels':return self.send_json({'id':production.create_channel(data)})
-            if self.path == '/api/production/projects':return self.send_json({'id':production.create_project(data)})
+            if self.path == '/api/production/shorts-bundle':
+                return self.send_json(shorts_bundle.create(data),201)
+            if self.path == '/api/production/shorts-bundle/recommend':
+                return self.send_json(shorts_bundle.recommend(data))
+            if self.path == '/api/production/shorts-bundle/automate':
+                return self.send_json(shorts_bundle.queue_automation(str(data.get('id',''))),202)
+            if self.path == '/api/production/publish':
+                return self.send_json(publishing.enqueue(data),202)
+            if self.path == '/api/production/publish/cancel':
+                return self.send_json(publishing.cancel(str(data.get('id',''))))
+            if self.path == '/api/production/shorts-performance':
+                return self.send_json(shorts_performance.save(data))
+            if self.path == '/api/production/channel-narration':
+                return self.send_json(shorts_bundle.save_narration_profile(str(data.get('id','')),data))
+            if self.path == '/api/production/projects':
+                share=data.get('share_text','')
+                if isinstance(share,str):share=share.strip()
+                record=project_import.source_record(share,data.get('rights_note','')) if share else None
+                if record and data.get('source_video_id'):
+                    raise ValueError('발굴한 영상 또는 공유 링크 중 하나를 선택하세요.')
+                project_id=production.create_project(data,record)
+                if record:
+                    project_import.start(project_id,ROOT/'media_worker.py',MEDIA_PYTHON)
+                return self.send_json({'id':project_id})
+            if self.path == '/api/production/share-import':
+                return self.send_json(project_import.start(str(data.get('id','')),ROOT/'media_worker.py',
+                                                           MEDIA_PYTHON,data.get('rights_note')))
+            workflow_actions = {
+                '/api/production/analyze': workflow.analyze,
+                '/api/production/confirm-analysis': workflow.confirm_analysis,
+                '/api/production/generate-script': workflow.generate_script,
+                '/api/production/qa': workflow.check_qa,
+            }
+            if self.path in workflow_actions:
+                return self.send_json(workflow_actions[self.path](str(data.get('id', ''))))
+            if self.path == '/api/production/narration':
+                result = workflow.queue_narration(str(data.get('id', '')))
+                return self.send_json(result, 200 if result['status']=='completed' else 202)
+            if self.path == '/api/production/approve-publish':
+                return self.send_json(workflow.approve_publish(str(data.get('id','')), data.get('reviewed'), data.get('rights_note')))
+            if self.path == '/api/production/analysis':
+                return self.send_json(workflow.save_analysis(str(data.get('id', '')), data.get('analysis')))
             if self.path == '/api/production/update':
-                production.update_project(data);return self.send_json({'message':'프로젝트를 저장했습니다. 설정 변경으로 이전 승인은 해제됩니다.'})
+                changed=production.update_project(data)
+                message='프로젝트를 저장했습니다. 이전 승인은 해제됩니다.' if changed else '프로젝트에 변경사항이 없습니다.'
+                return self.send_json({'message':message,'changed':changed})
             if self.path == '/api/production/comments': return self.send_json(source_comments(str(data.get('id',''))))
             if self.path == '/api/production/approve':
                 production.approve(str(data.get('id','')));return self.send_json({'message':'현재 대본과 스타일을 승인했습니다.'})
             if self.path == '/api/production/render':
-                production.start_render(str(data.get('id','')));return self.send_json({'message':'렌더링을 시작했습니다.'},202)
+                result = production.start_render(str(data.get('id','')))
+                return self.send_json(result, 200 if result['status']=='completed' else 202)
             if self.path == '/api/media/jobs': return self.send_json({'job_id':start_media_job(data)},202)
             if self.path == '/api/scan': return self.send_json({'message':scan()})
             if self.path == '/api/bookmarks':
@@ -528,16 +626,42 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc: self.fail(exc)
 
 def main():
-    init()
-    with connect() as con:
-        con.execute("UPDATE narrations SET status='error',message='서버 재시작으로 음성 준비가 중단되었습니다.' WHERE status='preparing'")
-        con.execute("UPDATE script_drafts SET status='error',message='서버 재시작으로 생성이 중단됐습니다. 다시 생성하세요.' WHERE status='generating'")
-        con.execute("UPDATE scene_analyses SET status='error',message='서버 재시작으로 분석이 중단됐습니다. 프레임 추출부터 다시 실행하세요.' WHERE status IN ('preparing','analyzing')")
-        con.execute("UPDATE production_projects SET status='error' WHERE status='rendering'")
-        con.execute("UPDATE media_jobs SET status='error',code='interrupted',message='서버가 재시작되어 작업이 중단되었습니다. 다시 시도하세요.' WHERE status IN ('queued','running')")
-    threading.Thread(target=scheduler,daemon=True).start()
-    server = ThreadingHTTPServer(('127.0.0.1',int(os.environ.get('PORT','8000'))),Handler)
-    print('mflowshorts server ready',flush=True)
-    server.serve_forever()
+    with ThreadingHTTPServer(('127.0.0.1',int(os.environ.get('PORT','8020'))),Handler) as server:
+        DB.parent.mkdir(parents=True, exist_ok=True)
+        # Hold the OS lock for the server lifetime. A crash releases it automatically.
+        with DB.resolve().with_suffix(DB.suffix+'.server-lock').open('a+b') as owner:
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    owner.seek(0)
+                    msvcrt.locking(owner.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise SystemExit('같은 데이터베이스를 사용하는 앱이 이미 실행 중입니다.') from None
+            init()
+            production.recover_renders()
+            project_import.recover()
+            publishing.recover()
+            with connect() as con:
+                con.execute("""UPDATE scene_analyses SET status='error',message='서버 재시작으로 분석이 중단됐습니다. 다시 실행하세요.'
+                               WHERE status IN ('preparing','analyzing')""")
+                con.execute("UPDATE media_jobs SET status='error',code='interrupted',message='서버가 재시작되어 작업이 중단되었습니다. 다시 시도하세요.' WHERE status IN ('queued','running')")
+            threading.Thread(target=scheduler,daemon=True).start()
+            stop = threading.Event()
+            worker = threading.Thread(target=production.render_worker,args=(stop,),daemon=True)
+            publisher = threading.Thread(target=publishing.worker,args=(stop,),daemon=True)
+            worker.start()
+            publisher.start()
+            print('mflowshorts server ready',flush=True)
+            try:
+                server.serve_forever()
+            finally:
+                stop.set()
+                production.RENDER_WAKE.set()
+                publishing.WAKE.set()
+                worker.join()
+                publisher.join()
 
 if __name__ == '__main__': main()

@@ -1,53 +1,125 @@
-import io,tempfile,wave
+import copy
+import io
+import json
+import os
 from pathlib import Path
-from unittest.mock import patch
+import tempfile
 import unittest
-import app,production,narration
+from unittest.mock import patch
+import wave
 
-def wav_bytes(seconds=.2):
- data=io.BytesIO()
- with wave.open(data,'wb') as w:w.setnchannels(1);w.setsampwidth(2);w.setframerate(24000);w.writeframes(b'\x00\x00'*round(seconds*24000))
- return data.getvalue()
+import narration
 
-class VoiceTests(unittest.TestCase):
- def setUp(self):
-  self.temp=tempfile.TemporaryDirectory();self.db=patch.object(app,'DB',Path(self.temp.name)/'db');self.root=patch.object(production,'PROJECT_ROOT',Path(self.temp.name)/'projects');self.db.start();self.root.start();app.init()
-  c=production.create_channel({'name':'voice'});self.ident=production.create_project({'title':'voice','channel_id':c});p=production.project(self.ident);p['document']['source']={'filename':'source','duration':8,'audio':True};p['document']['script']='첫 장면입니다. 다음 장면입니다.';p['document']['settings']['duration']=4;production.store(p);production.approve(self.ident)
- def tearDown(self):self.root.stop();self.db.stop();self.temp.cleanup()
- def upload(self):
-  body=wav_bytes();return narration.upload(self.ident,io.BytesIO(body),len(body))
- def test_unapproved_cannot_prepare(self):
-  production.update_project({'id':self.ident,'script':'새로운 대본'})
-  with self.assertRaises(ValueError):self.upload()
- def test_upload_is_not_claimed_as_aligned(self):
-  ident=self.upload();a=narration.get(ident)
-  self.assertEqual(a['data']['timing'],'manual_estimate');self.assertIsNone(production.project(self.ident)['document'].get('narration_id'))
- def test_activation_requires_confirmation_and_clears_render_approval(self):
-  ident=self.upload();a=narration.get(ident)
-  with self.assertRaises(ValueError):narration.activate(ident,a['data']['cues'],False)
-  narration.activate(ident,a['data']['cues'],True);doc=production.project(self.ident)['document'];self.assertEqual(doc['narration_id'],ident);self.assertIsNone(doc['approved_hash'])
- def test_script_edit_invalidates_voice(self):
-  ident=self.upload();a=narration.get(ident);narration.activate(ident,a['data']['cues'],True)
-  production.update_project({'id':self.ident,'script':'바뀐 대본'})
-  with self.assertRaises(ValueError):narration.for_render(production.project(self.ident))
-  self.assertTrue(narration.state(self.ident)['narration']['stale'])
- def test_long_voice_is_not_cut(self):
-  p=production.project(self.ident);p['document']['settings']['duration']=1;production.store(p);production.approve(self.ident)
-  body=wav_bytes(2);ident=narration.upload(self.ident,io.BytesIO(body),len(body))
-  with self.assertRaises(ValueError):narration.activate(ident,narration.get(ident)['data']['cues'],True)
- def test_file_change_is_rejected(self):
-  ident=self.upload();narration.file(ident).write_bytes(b'changed')
-  with self.assertRaises(ValueError):narration.file(ident)
- def test_measured_sentence_cues_from_real_wav_parts(self):
-  a=narration.create(production.project(self.ident),'tts');narration.LOCK.acquire()
-  with patch.object(narration,'speech',return_value=wav_bytes(.2)):narration.generate(a,production.project(self.ident),['첫 장면입니다.','다음 장면입니다.'])
-  result=narration.get(a['id']);self.assertEqual(result['status'],'ready');self.assertEqual(result['data']['timing'],'measured_sentences');self.assertAlmostEqual(result['data']['cues'][1]['start'],.2);self.assertAlmostEqual(result['data']['duration'],.4)
- def test_bad_or_overlapping_cues_rejected(self):
-  ident=self.upload()
-  with self.assertRaises(ValueError):narration.activate(ident,[{'text':'one','start':0,'end':.15},{'text':'two','start':.1,'end':.2}],True)
 
- def test_caption_sized_chunks_preserve_script_without_highlight_markup(self):
-  script='지금 *중요한 장면*을 살펴봅니다. 다음 장면에서는 다른 일이 일어납니다.'
-  chunks=narration.chunks(script)
-  self.assertEqual(''.join(chunks).replace(' ',''),script.replace('*','').replace(' ',''))
-  self.assertTrue(all(len(c)<=60 for c in chunks))
+class MeasuredEngine:
+    name = 'fixture-voice'
+    mock = False
+
+    def synthesize(self, text, output_path):
+        frames = 1000 if text == '첫 문장입니다.' else 2500
+        with wave.open(str(output_path), 'wb') as audio:
+            audio.setparams((1, 2, 1000, 0, 'NONE', 'not compressed'))
+            audio.writeframes(b'\x01\x00' * frames)
+
+
+class NarrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.folder = Path(self.temp.name)
+        self.script = {'approved': True, 'sentences': [
+            {'id': 's1', 'scene_id': 'a', 'kind': 'fact', 'section': 'hook', 'text': '첫 문장입니다.'},
+            {'id': 's2', 'scene_id': 'b', 'kind': 'fact', 'section': 'ending', 'text': '두 번째 문장입니다.'},
+        ]}
+
+    def test_unapproved_script_is_rejected_before_engine_runs(self):
+        for approval in (False, None, 1, 'true'):
+            with self.subTest(approval=approval), self.assertRaises(ValueError):
+                narration.synthesize({**self.script, 'approved': approval}, self.folder)
+        self.assertEqual(list(self.folder.iterdir()), [])
+
+    def test_openai_requires_a_key_and_measures_returned_wav(self):
+        with patch.dict(os.environ, {'MFLOW_AI_KEY': '', 'OPENAI_API_KEY': ''}):
+            with self.assertRaises(ValueError):
+                narration.configured_engine('openai')
+        wave_file = io.BytesIO()
+        with wave.open(wave_file, 'wb') as voice:
+            voice.setparams((1, 2, 24000, 0, 'NONE', 'not compressed'))
+            voice.writeframes(b'\x01\x00' * 12000)
+        responses = [io.BytesIO(wave_file.getvalue()) for _ in self.script['sentences']]
+        with patch.dict(os.environ, {'MFLOW_AI_KEY': 'fixture', 'MFLOW_TTS_MODEL': 'fixture-model'}), \
+                patch.object(narration.urllib.request, 'urlopen', side_effect=responses) as call:
+            result = narration.synthesize(self.script, self.folder, narration.configured_engine('openai'))
+        self.assertEqual([line['duration'] for line in result['segments']], [0.5, 0.5])
+        self.assertEqual(call.call_count, 2)
+        request = call.call_args_list[0].args[0]
+        self.assertEqual(request.full_url, 'https://api.openai.com/v1/audio/speech')
+        self.assertEqual(json.loads(request.data)['response_format'], 'wav')
+
+    def test_actual_pcm_frame_counts_determine_sentence_timings(self):
+        result = narration.synthesize(self.script, self.folder, MeasuredEngine())
+        self.assertFalse(result['mock'])
+        self.assertEqual(result['duration'], 3.5)
+        self.assertEqual([(s['start'], s['end'], s['duration']) for s in result['segments']],
+                         [(0, 1, 1), (1, 3.5, 2.5)])
+        self.assertEqual([s['scene_id'] for s in result['segments']], ['a', 'b'])
+        with wave.open(str(self.folder / 'narration.wav'), 'rb') as audio:
+            self.assertEqual(audio.getnframes(), 3500)
+        self.assertTrue((self.folder / 'narration.json').is_file())
+
+    def test_mock_is_explicit_and_contains_only_silence(self):
+        result = narration.synthesize(self.script, self.folder, narration.MockTTS())
+        self.assertTrue(result['mock'])
+        self.assertEqual(result['engine'], 'mock-silence')
+        with wave.open(str(self.folder / 'narration.wav'), 'rb') as audio:
+            self.assertEqual(set(audio.readframes(audio.getnframes())), {0})
+
+    def test_modified_script_changes_audio_binding(self):
+        changed = copy.deepcopy(self.script)
+        changed['sentences'][0]['text'] = '수정한 문장입니다.'
+        self.assertNotEqual(narration.script_fingerprint(changed), narration.script_fingerprint(self.script))
+
+    def test_bad_sentence_ids_and_empty_sentences_are_rejected(self):
+        invalid = [[], [self.script['sentences'][0]] * 2,
+                   [{**self.script['sentences'][0], 'scene_id': ''}],
+                   [{**self.script['sentences'][0], 'text': ' '}],
+                   [None]]
+        for sentences in invalid:
+            with self.subTest(sentences=sentences), self.assertRaises(ValueError):
+                narration.synthesize({'approved': True, 'sentences': sentences}, self.folder)
+
+    def test_failed_provider_preserves_previous_output(self):
+        narration.synthesize(self.script, self.folder, MeasuredEngine())
+        before = (self.folder / 'narration.wav').read_bytes()
+
+        class Broken(MeasuredEngine):
+            def synthesize(self, text, output_path):
+                raise ValueError('provider failed')
+
+        with self.assertRaisesRegex(ValueError, 'provider failed'):
+            narration.synthesize(self.script, self.folder, Broken())
+        self.assertEqual((self.folder / 'narration.wav').read_bytes(), before)
+        self.assertEqual(sorted(p.name for p in self.folder.iterdir()), ['narration.json', 'narration.wav'])
+
+    def test_mismatched_pcm_formats_rejected(self):
+        class ChangedFormat(MeasuredEngine):
+            def synthesize(self, text, output_path):
+                with wave.open(str(output_path), 'wb') as audio:
+                    audio.setparams((1, 2, 1000 if text.startswith('첫') else 2000, 0, 'NONE', 'not compressed'))
+                    audio.writeframes(b'\x00\x00' * 1000)
+
+        with self.assertRaisesRegex(ValueError, '형식'):
+            narration.synthesize(self.script, self.folder, ChangedFormat())
+        self.assertFalse((self.folder / 'narration.wav').exists())
+
+    def test_default_and_explicit_engine_selection(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsInstance(narration.configured_engine(), narration.MockTTS)
+        with patch.dict(os.environ, {'MFLOW_TTS_ENGINE': 'sapi'}):
+            self.assertIsInstance(narration.configured_engine(), narration.WindowsSAPI)
+        with patch.dict(os.environ, {'MFLOW_TTS_ENGINE': 'external'}), self.assertRaises(ValueError):
+            narration.configured_engine()
+
+
+if __name__ == '__main__':
+    unittest.main()

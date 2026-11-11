@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -19,6 +20,32 @@ class ProductionTests(unittest.TestCase):
     def tearDown(self):self.root.stop();self.db.stop();self.temp.cleanup()
     def add_source(self):
         with patch.object(production,'probe',return_value={'duration':20,'width':1920,'height':1080,'audio':True}):production.upload(self.ident,io.BytesIO(b'source'),6)
+    def test_existing_main_narration_is_checked_and_invalidated(self):
+        self.add_source()
+        production.update_project({'id': self.ident, 'script': '원래 대본'})
+        project = production.project(self.ident)
+        doc = project['document']
+        voice_id = 'b' * 32
+        doc['narration_id'] = voice_id
+        production.store(project)
+        voice = production.PROJECT_ROOT / self.ident / 'narration' / voice_id / 'voice.wav'
+        voice.parent.mkdir(parents=True)
+        voice.write_bytes(b'legacy WAV')
+        payload = {'script': doc['script'], 'source': doc['source'],
+                   'start': doc['settings']['start'], 'duration': doc['settings']['duration']}
+        signature = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        data = {'duration': 1.0, 'sha256': hashlib.sha256(voice.read_bytes()).hexdigest()}
+        with app.connect() as con:
+            con.execute('CREATE TABLE narrations (id, project_id, signature, status, data)')
+            con.execute('INSERT INTO narrations VALUES (?, ?, ?, ?, ?)',
+                        (voice_id, self.ident, signature, 'ready', json.dumps(data)))
+        self.assertEqual(production.legacy_narration(project, doc, 2), (voice.resolve(), 1.0))
+        voice.write_bytes(b'changed WAV')
+        with self.assertRaises(ValueError):
+            production.legacy_narration(project, doc, 2)
+        production.update_project({'id': self.ident, 'script': '바뀐 대본'})
+        self.assertNotIn('narration_id', production.project(self.ident)['document'])
+
     def test_approval_required_and_changes_revoke_approval(self):
         with self.assertRaises(ValueError):production.start_render(self.ident)
         self.add_source();production.update_project({'id':self.ident,'script':'사실을 확인한 새 대본'})
@@ -46,6 +73,80 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(production.settings({})['layout'],'band')
         self.assertEqual(production.settings({'layout':'fit'})['layout'],'fit')
         with self.assertRaises(ValueError):production.settings({'layout':'stretch'})
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(production.FONT).is_file(),
+                         'needs FFmpeg and a render font')
+    def test_clip_framing_survives_reordering_and_matches_rendered_frames(self):
+        source = Path(self.temp.name) / 'landscape.mp4'
+        subprocess.run([
+            'ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=red:s=640x360:r=30:d=2',
+            '-vf', "drawbox=x=320:w=320:h=360:c=blue:t=fill,"
+                   "drawbox=w=320:h=360:c=lime:t=fill:enable='gte(t,1)',"
+                   "drawbox=x=320:w=320:h=360:c=yellow:t=fill:enable='gte(t,1)'",
+            '-pix_fmt', 'yuv420p', str(source),
+        ], check=True, capture_output=True)
+        with source.open('rb') as reader:
+            production.upload(self.ident, reader, source.stat().st_size)
+        first = {'start': 0, 'end': 1, 'framing': {'mode': 'fill', 'zoom': 1.2, 'x': 350, 'y': -30}}
+        second = {'start': 1, 'end': 2, 'framing': {'mode': 'fit', 'zoom': 1.1, 'x': -180, 'y': 140}}
+        production.update_project({'id': self.ident, 'clips': [first, second]})
+        saved = production.project(self.ident)['document']['clips']
+        production.update_project({'id': self.ident, 'clips': saved[::-1]})
+        self.assertEqual(production.project(self.ident)['document']['clips'], [second, first])
+        production.approve(self.ident)
+        approved=production.project(self.ident)
+        self.assertFalse(production.update_project({'id':self.ident,'clips':[second,first]}))
+        self.assertEqual(production.project(self.ident),approved)
+        with patch.object(production, 'state', return_value={'render_available': True}):
+            production.start_render(self.ident)
+        self.assertTrue(production.process_next_render())
+        self.assertEqual(production.project(self.ident)['status'], 'completed')
+        output = production.asset(self.ident, 'output')
+        self.assertEqual(production.probe(output)['duration'], 2)
+
+        def pixel(args, x, y):
+            return subprocess.check_output([
+                'ffmpeg', '-v', 'error', *args, '-vf', f'format=rgb24,crop=1:1:{x}:{y}',
+                '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-',
+            ])
+
+        # In output order the centered subjects are yellow, then red.
+        # At y=720 the shifted fit clip is still in its black border.
+        for time, center, upper in ((0.5, (255, 255, 0), (0, 0, 0)),
+                                    (1.5, (255, 0, 0), (255, 0, 0))):
+            preview = Path(self.temp.name) / f'preview-{time}.png'
+            preview.write_bytes(production.preview_frame(self.ident, time))
+            for y, expected in ((900, center), (720, upper)):
+                samples = (
+                    pixel(['-i', str(preview)], 270, y // 2),
+                    pixel(['-ss', str(time), '-i', str(output)], 540, y),
+                )
+                for sample in samples:
+                    self.assertEqual(len(sample), 3)
+                    self.assertTrue(all(abs(a-b) < 15 for a,b in zip(sample, expected)), (time, y, sample))
+
+        completed=production.project(self.ident)
+        archive=production.asset(self.ident,'archive')
+        draft_preview=Path(self.temp.name)/'unsaved.png'
+        draft_preview.write_bytes(production.preview_frame(self.ident,0.5,{'clips':[first,second]}))
+        self.assertGreater(pixel(['-i',str(draft_preview)],270,450)[0],240)
+        self.assertLess(pixel(['-i',str(draft_preview)],270,450)[1],15)
+        self.assertFalse(production.update_project({'id':self.ident,'clips':[second,first],
+            'cues':[],'overlays':[],'audio_mix':None,'credit_on':True}))
+        self.assertEqual(production.project(self.ident),completed)
+        self.assertEqual(production.asset(self.ident,'output'),output)
+        self.assertEqual(production.asset(self.ident,'archive'),archive)
+
+        for change in ({'cues':[{'text':'새 자막','start':0}]},
+                       {'clips':[first,second]}, {'audio_mix':{'source_volume':50}}):
+            with self.subTest(change=change):
+                self.assertTrue(production.update_project({'id':self.ident,**change}))
+                updated=production.project(self.ident)
+                self.assertIsNone(updated['document']['approved_hash'])
+                self.assertNotIn('output',updated['document'])
+                self.assertNotIn('archive',updated['document'])
+                production.approve(self.ident)
+                self.assertEqual(production.project(self.ident)['status'],'approved')
     def test_layout_keeps_video_clear_of_title_band(self):
         area=production.VIDEO_BOTTOM-production.TITLE_HEIGHT
         band,fill,fit=(','.join(production.layout_filters(name)) for name in ('band','fill','fit'))
@@ -68,6 +169,25 @@ class ProductionTests(unittest.TestCase):
             ass,_=production.subtitles({'headline':'{\\pos(0,0)}제목','script':'대본'},production.STYLES['basic'],5,False)
         self.assertNotIn('{\\pos(0,0)}',ass)
         self.assertNotIn(',Caption,,',ass)
+    def test_timed_overlays_persist_and_render_independently_of_captions(self):
+        self.add_source()
+        item={'text':r'{\pos(0,0)} 글귀','x':.25,'y':.75,'size':64,'start':1.25,'end':4,'font':''}
+        production.update_project({'id':self.ident,'script':'대본','overlays':[item]})
+        production.approve(self.ident)
+        doc=production.project(self.ident)['document']
+        self.assertEqual(doc['overlays'],[item])
+        self.assertNotEqual(production.fingerprint(doc),production.fingerprint({**doc,'overlays':[]}))
+        legacy={key:value for key,value in doc.items() if key!='overlays'}
+        self.assertEqual(production.fingerprint(legacy),production.fingerprint({**legacy,'overlays':[]}))
+        with patch.object(production,'font_info',return_value=('Test Font',700)):
+            ass,srt=production.subtitles(doc,production.STYLES['basic'],3,False)
+        self.assertIn(r'Dialogue: 3,0:00:01.25,0:00:03.00,Caption,,0,0,0,,{\an5\pos(270,1440)\fnTest Font\fs64\b1',ass)
+        self.assertIn('｛＼pos(0,0)｝ 글귀',ass)
+        self.assertNotIn('글귀',srt)
+        for key,bad in [('x',float('nan')),('size',200),('end',1),('font','../font.ttf')]:
+            with self.subTest(key=key),self.assertRaises(ValueError):
+                production.update_project({'id':self.ident,'overlays':[{**item,key:bad}]})
+        self.assertEqual(production.project(self.ident)['document']['approved_hash'],doc['approved_hash'])
     def test_custom_fonts_from_fonts_folder(self):
         fonts=Path(self.temp.name)/'fonts';fonts.mkdir();(fonts/'Display.ttf').write_bytes(b'x');(fonts/'notes.txt').write_text('x')
         with patch.object(production,'FONTS_DIR',fonts),patch.object(production,'font_info',return_value=('Display Font',400)):
@@ -170,6 +290,25 @@ class ProductionTests(unittest.TestCase):
         base={'source':{'filename':'a.mp4'},'script':'s','headline':'h','settings':production.default_settings()}
         self.assertEqual(production.fingerprint(base),production.fingerprint({**base,'cues':[]}))
         self.assertNotEqual(production.fingerprint(base),production.fingerprint({**base,'cues':items}))
+    def test_caption_style_overrides_survive_save_and_keep_outline_with_background(self):
+        self.add_source()
+        style={'size':82,'color':'#00ff00','outline':8,'outline_color':'#ff00ff','background':'#112233'}
+        items=[{'text':'First','start':0.2,'end':1.13,'pos':'middle','style':style},
+               {'text':'Second','start':1.13,'end':2,'pos':'top'}]
+        production.update_project({'id':self.ident,'cues':items})
+        doc=production.project(self.ident)['document']
+        self.assertEqual(doc['cues'][0]['style'],style)
+        self.assertNotIn('style',doc['cues'][1])
+        with patch.object(production,'font_info',return_value=('Test Font',700)):
+            ass,srt=production.subtitles(doc,production.STYLES['basic'],4,True)
+        self.assertIn('Style: Cue0,Test Font,82,&H0000ff00&,&H000000FF&,&H00ff00ff&,&H00332211&',ass)
+        self.assertIn(',4,8,6,2,0,0,0,1',ass.split('Style: Cue0,')[1].splitlines()[0])
+        self.assertIn('0:00:00.20,0:00:01.13,Cue0',ass)
+        self.assertIn('00:00:01,130 --> 00:00:02,000\nSecond',srt)
+        for invalid in ({'size':145},{'outline':True},{'background':'red'},{'font':'../missing.ttf'}):
+            with self.subTest(invalid=invalid),self.assertRaises(ValueError):
+                production.cues([{'text':'First','style':invalid}])
+
     def test_rendering_project_cannot_be_edited(self):
         p=production.project(self.ident);p['status']='rendering';production.store(p)
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'script':'edit'})
@@ -223,7 +362,7 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(production.blurs([{'x':0.1,'y':0.6,'w':0.8,'h':0.05,'mode':'ai'}])[0]['mode'],'ai')
         with patch.object(production,'AI_ROOT',Path(self.temp.name)/'none'),patch.dict(production._TOOL_CACHE,clear=True):
             self.assertIsNone(production.ai_eraser());self.assertFalse(production.state()['ai_ready'])
-            with self.assertRaisesRegex(ValueError,'install_ai_eraser'):production.erase_ai('a.mp4','b.mp4',[])
+            with self.assertRaisesRegex(ValueError,'VSR'):production.erase_ai('a.mp4','b.mp4',[])
     @unittest.skipUnless(shutil.which('ffmpeg') and Path(production.FONT).is_file(),'needs ffmpeg and a Korean font')
     def test_ai_mode_renders(self):
         source=Path(self.temp.name)/'src.mp4'
@@ -261,14 +400,61 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(output.read_bytes(),source.read_bytes())
     def test_unexpected_render_error_is_recoverable(self):
         self.add_source();production.update_project({'id':self.ident,'script':'대본'});production.approve(self.ident)
-        with patch.object(production,'state',return_value={'render_available':True}),patch.object(production.threading,'Thread') as thread:
+        with patch.object(production,'state',return_value={'render_available':True}):
             production.start_render(self.ident)
-        p=thread.call_args.kwargs['args'][0]
-        with patch.object(production,'STYLES',{}),patch('traceback.print_exc'):production.render(p)
+        with patch.object(production,'STYLES',{}),patch('traceback.print_exc'):production.process_next_render()
         self.assertEqual(production.project(self.ident)['status'],'error')
         self.assertFalse(production.LOCK.locked())
         self.assertEqual([x for x in (production.PROJECT_ROOT/self.ident).iterdir() if x.is_dir()],[])
         production.update_project({'id':self.ident,'script':'수정한 대본'})
+
+    def test_queue_deduplicates_and_claims_projects_in_order(self):
+        self.add_source()
+        production.update_project({'id':self.ident,'script':'대본'})
+        production.approve(self.ident)
+        other=production.create_project({'title':'두 번째','channel_id':self.channel})
+        with patch.object(production,'probe',return_value={'duration':20,'width':640,'height':480,'audio':False}):
+            production.upload(other,io.BytesIO(b'source'),6)
+        production.update_project({'id':other,'script':'두 번째 대본'})
+        production.approve(other)
+        with patch.object(production,'state',return_value={'render_available':True}):
+            first=production.start_render(self.ident)
+            self.assertEqual(production.start_render(self.ident)['job_id'],first['job_id'])
+            production.start_render(other)
+        calls=[]
+        def finish(project):
+            calls.append(project['id'])
+            project['status']='completed'
+            production.store(project)
+            production.LOCK.release()
+        with patch.object(production,'render',side_effect=finish):
+            self.assertTrue(production.process_next_render())
+            self.assertTrue(production.process_next_render())
+            self.assertFalse(production.process_next_render())
+        self.assertEqual(calls,[self.ident,other])
+        with app.connect() as con:
+            jobs=con.execute('SELECT status,attempts FROM production_render_jobs').fetchall()
+        self.assertEqual([tuple(job) for job in jobs],[('completed',1),('completed',1)])
+
+    def test_restart_requeues_interrupted_render_and_bounds_recovery(self):
+        self.add_source()
+        production.update_project({'id':self.ident,'script':'대본'})
+        production.approve(self.ident)
+        with patch.object(production,'state',return_value={'render_available':True}):
+            job=production.start_render(self.ident)
+            with app.connect() as con:
+                con.execute("UPDATE production_render_jobs SET status='running',attempts=1")
+            app.init()
+            production.recover_renders()
+            self.assertEqual(production.start_render(self.ident)['job_id'],job['job_id'])
+            self.assertEqual(production.start_render(self.ident)['status'],'queued')
+            with app.connect() as con:
+                con.execute("UPDATE production_render_jobs SET status='running',attempts=?", (production.MAX_RENDER_ATTEMPTS,))
+            production.recover_renders()
+            self.assertEqual(production.project(self.ident)['status'],'error')
+            retry=production.start_render(self.ident)
+            self.assertNotEqual(retry['job_id'],job['job_id'])
+            self.assertEqual(retry['status'],'queued')
     def test_headline_must_fit_three_lines(self):
         with self.assertRaises(ValueError):production.update_project({'id':self.ident,'headline':'가'*55})
         production.update_project({'id':self.ident,'headline':'가'*54})

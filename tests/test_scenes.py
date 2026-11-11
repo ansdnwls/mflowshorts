@@ -1,4 +1,9 @@
-import tempfile,json
+import io
+import json
+import shutil
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 import unittest
@@ -37,6 +42,67 @@ class SceneTests(unittest.TestCase):
   segments=scenes.get(self.ident)['data']['segments'];scenes.review(self.project,segments,'',True)
   segments[0]['observed']='다른 사실';scenes.review(self.project,segments,'',False)
   self.assertIsNone(scenes.get(self.ident)['data']['review_hash'])
+
+ def test_reviewed_frames_feed_the_production_script(self):
+  with self.assertRaises(ValueError):
+   scenes.apply_review(self.project)
+  item = scenes.get(self.ident)
+  scenes.review(self.project, item['data']['segments'], '', True)
+  analysis = scenes.apply_review(self.project)['analysis']
+  self.assertTrue(analysis['confirmed'])
+  self.assertEqual(analysis['scenes'][0]['facts'], ['사람이 걷는다'])
+  self.assertEqual(analysis['scenes'][0]['inferences'], ['목적은 불명확'])
+
+  def response(indices):
+   return {'choices': [{'message': {'content': json.dumps({'indices': indices})}}]}
+
+  with patch.object(scenes, 'api', return_value=response([0, 0, 1])):
+   script = scenes.generate_ai_script(self.project)['script']
+  self.assertEqual(script['provider'], 'openai_evidence')
+  self.assertEqual([line['section'] for line in script['sentences']], ['hook', 'situation', 'ending'])
+  self.assertEqual([line['kind'] for line in script['sentences']], ['fact', 'fact', 'inference'])
+  scenes.apply_review(self.project)
+  self.assertEqual(production.project(self.project)['document']['generated_script'], script)
+  for invalid in ([1, 0, 0], [0, 0, 10], [0, 0, True]):
+   with patch.object(scenes, 'api', return_value=response(invalid)), self.assertRaises(ValueError):
+    scenes.generate_ai_script(self.project)
+  self.assertEqual(production.project(self.project)['document']['generated_script'], script)
+  item['data']['segments'][0]['observed'] = '사람이 멈춘다'
+  scenes.review(self.project, item['data']['segments'], '', True)
+  updated = production.project(self.project)['document']
+  self.assertFalse(updated['analysis']['confirmed'])
+  self.assertNotIn('generated_script', updated)
+  scenes.apply_review(self.project)
+  production.update_project({'id': self.project, 'settings': {**updated['settings'], 'start': 3}})
+  self.assertNotIn('analysis', production.project(self.project)['document'])
+  self.assertTrue(scenes.state(self.project)['analysis']['stale'])
+
+ @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg and FFprobe required')
+ def test_real_frame_and_audio_extraction_feeds_local_script(self):
+  source = Path(self.tmp.name) / 'scene.mp4'
+  subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=24',
+                  '-f', 'lavfi', '-i', 'sine=440', '-t', '3', '-c:v', 'libx264',
+                  '-threads', '2', '-c:a', 'aac', str(source)],
+                 check=True, capture_output=True, timeout=20)
+  payload = source.read_bytes()
+  production.upload(self.project, io.BytesIO(payload), len(payload))
+  project = production.project(self.project)
+  production.update_project({'id': self.project, 'settings': {**project['document']['settings'], 'start': 0}})
+  ident = scenes.start(self.project, 'prepare', 2)
+  deadline = time.monotonic() + 20
+  item = scenes.get(ident)
+  while item['status'] == 'preparing' and time.monotonic() < deadline:
+   time.sleep(0.05)
+   item = scenes.get(ident)
+  self.assertEqual(item['status'], 'prepared', item['message'])
+  self.assertTrue(item['data']['has_audio'])
+  self.assertEqual([frame['at'] for frame in item['data']['frames']], [0, 2])
+  self.assertTrue(scenes.frame(ident, 0).read_bytes().startswith(b'\xff\xd8'))
+  item['data']['segments'][0]['observed'] = '색상 패턴이 움직인다'
+  scenes.review(self.project, item['data']['segments'], '', True)
+  scenes.apply_review(self.project)
+  result = scenes.workflow.generate_script(self.project)['script']
+  self.assertTrue(all(line['kind'] == 'fact' for line in result['sentences']))
 
  def test_audio_transcript_has_original_timestamps(self):
   item=scenes.get(self.ident);item['data']['has_audio']=True
