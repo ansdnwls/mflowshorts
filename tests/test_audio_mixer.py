@@ -9,6 +9,7 @@ from array import array
 from unittest.mock import patch
 
 import app
+import audio_mixer
 import production
 
 
@@ -35,6 +36,21 @@ def amplitude(audio, frequency, start, end):
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe') and Path(production.FONT).is_file(),
                      'FFmpeg, FFprobe and the production font are required')
 class AudioMixerTests(unittest.TestCase):
+    def test_generated_speech_ducks_original_even_without_music(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, voice, output = (root / name for name in ('source.wav', 'voice.wav', 'mix.wav'))
+            ffmpeg('-f', 'lavfi', '-i', 'sine=f=400:r=48000:d=2', source)
+            ffmpeg('-f', 'lavfi', '-i', r'aevalsrc=0.1*sin(2*PI*800*t)*between(t\,0.7\,1.2):s=48000:d=2', voice)
+            mix = audio_mixer.settings({'source_volume': 100}, root)
+            audio_mixer.render(output, source, 'wav', [(0, 2, 2)], 2, mix, True, root,
+                               (voice, 2), duck_generated_source=True)
+            mixed = samples(output)
+            original = amplitude(mixed, 400, 0.25, 0.45)
+            self.assertGreater(original, 0.1)
+            self.assertAlmostEqual(amplitude(mixed, 400, 0.85, 1.1) / original, 0.18, delta=0.02)
+            self.assertAlmostEqual(amplitude(mixed, 400, 1.65, 1.85), original, delta=0.002)
+
     def test_saved_reordered_mix_matches_preview_and_export(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

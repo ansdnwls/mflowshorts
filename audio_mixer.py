@@ -125,7 +125,8 @@ def speech_envelope(args, chain, duration, reduction):
     return f"1-{reduction / 100}*min(1,{'+'.join(ramps)})"
 
 
-def render(output, source, source_formats, cuts, duration, mix, original, directory, generated=None):
+def render(output, source, source_formats, cuts, duration, mix, original, directory, generated=None,
+           *, duck_generated_source=False):
     """Write the same PCM mix for both the preview and the final picture."""
     inputs = []
     filters = []
@@ -136,7 +137,8 @@ def render(output, source, source_formats, cuts, duration, mix, original, direct
         inputs.extend(args)
         return f'[{index}:a:0]'
 
-    if original and mix['source_volume']:
+    has_original = bool(original and mix['source_volume'])
+    if has_original:
         label = add_input(input_args(source, source_formats))
         branches = ''.join(f'[orig{i}]' for i in range(len(cuts)))
         filters.append(f'{label}aresample=48000:async=1:first_pts=0,'
@@ -146,14 +148,17 @@ def render(output, source, source_formats, cuts, duration, mix, original, direct
                            f'apad,atrim=duration={span:.6f}[origcut{i}]')
         parts = ''.join(f'[origcut{i}]' for i in range(len(cuts)))
         filters.append(f"{parts}concat=n={len(cuts)}:v=0:a=1,volume={mix['source_volume'] / 100}[original]")
-        labels.append('[original]')
 
     duck = mix['duck']
     envelope = '1'
+    source_envelope = '1'
+    music = mix['music']
+    duck_music = duck['enabled'] and duck['reduction'] and music.get('clip') and not music['muted'] and music['volume']
     for key in TRACKS:
         track = mix[key]
         clip = track.get('clip')
-        if not clip and key == 'narration' and generated:
+        using_generated = not clip and key == 'narration' and generated is not None
+        if using_generated:
             path, length = generated
             clip = {'in': 0, 'out': length, 'at': 0}
         elif clip:
@@ -162,16 +167,27 @@ def render(output, source, source_formats, cuts, duration, mix, original, direct
             continue
         args = input_args(path)
         chain = placed_audio(clip, duration) + f",volume={track['volume'] / 100}"
-        if key == 'narration' and duck['enabled'] and duck['reduction'] and mix['music'].get('clip') and not mix['music']['muted'] and mix['music']['volume']:
+        if key == 'narration':
             # Include trailing silence so detection can locate the final release point.
             detection = chain + f',apad=whole_dur={duration + 0.2:.6f}'
-            envelope = speech_envelope(args, detection, duration, duck['reduction'])
+            if duck_music:
+                envelope = speech_envelope(args, detection, duration, duck['reduction'])
+            if using_generated and duck_generated_source and has_original:
+                source_envelope = envelope if duck_music and duck['reduction'] == 82 else speech_envelope(
+                    args, detection, duration, 82,
+                )
         if key == 'music' and envelope != '1':
             chain += f",asetnsamples=n=480:p=0,volume='{envelope}':eval=frame"
         label = f'[{key}]'
         filters.append(f'{add_input(args)}{chain}{label}')
         labels.append(label)
 
+    if has_original:
+        if source_envelope == '1':
+            labels.append('[original]')
+        else:
+            filters.append(f"[original]asetnsamples=n=480:p=0,volume='{source_envelope}':eval=frame[ducked_original]")
+            labels.append('[ducked_original]')
     filters.append(f'anullsrc=r=48000:cl=stereo:d={duration}[silence]')
     labels.append('[silence]')
     filters.append(''.join(labels) + f'amix=inputs={len(labels)}:duration=longest:normalize=0,'

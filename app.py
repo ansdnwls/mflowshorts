@@ -16,6 +16,8 @@ import reference_captions
 import shorts_bundle
 import publishing
 import shorts_performance
+import material_library
+import scene_analysis
 import project_import
 import workflow
 import comment_picker
@@ -56,6 +58,8 @@ def init():
     production.init(connect)
     publishing.init()
     shorts_performance.init()
+    material_library.init()
+    scene_analysis.init()
     with connect() as con:
         con.executescript('''CREATE TABLE IF NOT EXISTS videos (
           id TEXT PRIMARY KEY, platform TEXT, title TEXT, channel TEXT, url TEXT,
@@ -358,9 +362,26 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError,ConnectionResetError): pass
         except Exception as exc: self.fail(exc)
     def route_get(self):
+        if self.path == '/api/materials/state':
+            return self.send_json(material_library.state())
+        if self.path.startswith('/api/scenes/state?'):
+            query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            return self.send_json(scene_analysis.state(query.get('id',[''])[0]))
+        if self.path.startswith('/api/scenes/frame?'):
+            query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:path=scene_analysis.frame(query.get('id',[''])[0],int(query.get('index',['-1'])[0]))
+            except ValueError:return self.send_error(404)
+            body=path.read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type','image/jpeg')
+            self.send_header('Content-Length',str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == '/api/production/state':
             return self.send_json({**production.state(),'publishing':publishing.snapshot(),
-                                   'shorts_performance':shorts_performance.snapshot()})
+                                   'shorts_performance':shorts_performance.snapshot(),
+                                   'ai_configured':scene_analysis.configured()})
         if self.path == '/api/production/recovery': return self.send_json(production.recovery_drafts())
         if self.path.startswith('/api/production/waveform?'):
             query=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -433,7 +454,8 @@ class Handler(BaseHTTPRequestHandler):
                 writer.writerow(["'"+str(c) if isinstance(c,str) and c.lstrip().startswith(('=','+','-','@')) else c for c in cells])
             body = ('\ufeff'+output.getvalue()).encode('utf-8')
             self.send_response(200); self.send_header('Content-Type','text/csv; charset=utf-8'); self.send_header('Content-Disposition','attachment; filename=mflow-videos.csv'); self.end_headers(); self.wfile.write(body); return
-        files = {'/':'index.html','/app.js':'app.js','/style.css':'style.css','/production.js':'production.js'}
+        files = {'/':'index.html','/app.js':'app.js','/style.css':'style.css','/production.js':'production.js',
+                 '/scene-analysis.js':'scene-analysis.js','/materials.js':'materials.js'}
         name = files.get(self.path)
         if not name: return self.send_error(404)
         body = (ROOT/'web'/name).read_bytes()
@@ -461,11 +483,32 @@ class Handler(BaseHTTPRequestHandler):
                 except TimeoutError:
                     return self.send_json({'error':'참고 영상 업로드 시간이 초과됐습니다.'},408)
             large_requests = ('/api/production/analysis','/api/production/recovery',
-                              '/api/production/update','/api/production/caption-drafts')
+                              '/api/production/update','/api/production/caption-drafts','/api/scenes/review',
+                              '/api/materials/save')
             limit = 1024 * 1024 if self.path in large_requests else 16384
             if length < 0 or length > limit: raise ValueError('요청이 너무 큽니다.')
             data = json.loads(self.rfile.read(length) or b'{}')
             if not isinstance(data,dict): raise ValueError('JSON 객체가 필요합니다.')
+            if self.path == '/api/materials/collect':
+                ids=material_library.collect(data.get('video_ids'),data.get('min_views',1000000),data.get('min_ratio',3))
+                return self.send_json({'video_ids':ids})
+            if self.path == '/api/materials/save':
+                material_library.save(data)
+                return self.send_json({'message':'소재 기획을 저장했습니다.'})
+            if self.path == '/api/materials/outcomes':
+                material_library.outcome(data)
+                return self.send_json({'message':'재가공 버전의 성과를 기록했습니다.'})
+            if self.path == '/api/scenes/start':
+                ident=scene_analysis.start(str(data.get('project_id','')),data.get('action'),data.get('interval',2))
+                return self.send_json({'id':ident},202)
+            if self.path == '/api/scenes/review':
+                scene_analysis.review(str(data.get('project_id','')),data.get('segments'),
+                                      data.get('transcript',''),data.get('confirmed',False))
+                return self.send_json({'message':'분석 검토 내용을 저장했습니다.'})
+            if self.path == '/api/scenes/apply':
+                return self.send_json(scene_analysis.apply_review(str(data.get('project_id',''))))
+            if self.path == '/api/production/generate-ai-script':
+                return self.send_json(scene_analysis.generate_ai_script(str(data.get('id',''))))
             if self.path == '/api/production/recovery':
                 production.write_recovery_draft(data)
                 return self.send_json({'ok':True})
@@ -602,6 +645,8 @@ def main():
             project_import.recover()
             publishing.recover()
             with connect() as con:
+                con.execute("""UPDATE scene_analyses SET status='error',message='서버 재시작으로 분석이 중단됐습니다. 다시 실행하세요.'
+                               WHERE status IN ('preparing','analyzing')""")
                 con.execute("UPDATE media_jobs SET status='error',code='interrupted',message='서버가 재시작되어 작업이 중단되었습니다. 다시 시도하세요.' WHERE status IN ('queued','running')")
             threading.Thread(target=scheduler,daemon=True).start()
             stop = threading.Event()

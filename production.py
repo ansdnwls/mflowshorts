@@ -304,6 +304,13 @@ def create_project(data, share_record=None):
         doc['credit']=credit_line(video['channel'])
         doc['context']=((note['attribution']+'\n'+note['notes']).strip() if note else '')[:2000]
         doc['source_video_id']=str(data['source_video_id'])
+        with CONNECT() as con:
+            material=con.execute('SELECT hypothesis,angle FROM material_notes WHERE video_id=?',
+                                 (doc['source_video_id'],)).fetchone()
+        if material:
+            doc['material_brief']=dict(material)
+            doc['context']=('새 해석: '+material['angle']+'\n흥행 이유 가설: '+material['hypothesis']+
+                            '\n'+doc['context']).strip()[:2000]
     if share_record is not None:
         doc['share_import']=share_record
         doc['source_url']=share_record['original_url'] or share_record['share_url']
@@ -344,10 +351,19 @@ def update_project(data):
     previous.update(credit_on=doc.get('credit_on',True),settings={**default_settings(),**doc['settings']})
     changed=title!=p['title'] or changes!=previous
     if changed:
+        range_changed=any(changes['settings'][key]!=previous['settings'][key] for key in ('start','duration'))
+        if range_changed and (doc.get('analysis') or {}).get('provider')=='reviewed_frames':
+            doc.pop('analysis')
+            if doc.pop('generated_script',None):
+                changes['script']=''
+                script=''
+            doc.pop('narration',None)
         if (mix or doc.get('audio_mix')) and current_voice(doc):
             doc['narration']['mixer_base_hash']=fingerprint(doc, include_mix=False)
         if script != doc['script']:
             doc.pop('narration',None)
+        if script!=doc['script'] or cuts!=previous['clips'] or range_changed:
+            doc.pop('narration_id',None)
         for key in ('qa_report','publish_approval','output','archive'):
             doc.pop(key,None)
         bundle_voice=doc.get('bundle_narration')
@@ -419,7 +435,8 @@ def apply_source(p,path,info):
     p['document'].update({'source':{'filename':path.name,**info},'approved_hash':None,'message':'원본 업로드 완료. 스타일과 대본을 준비하세요.'})
     p['document'].pop('output',None);p['document'].pop('archive',None)
     if p['document'].get('generated_script'):p['document']['script']=''
-    for key in ('analysis','generated_script','narration','qa_report','publish_approval','clips','quotes'):p['document'].pop(key,None)
+    for key in ('analysis','generated_script','narration','narration_id','qa_report','publish_approval','clips','quotes'):
+        p['document'].pop(key,None)
     p['status']='script_ready' if p['document']['script'] else 'source_ready'
 
 
@@ -441,6 +458,7 @@ def fingerprint(doc, *, include_mix=True):
     if include_mix and doc.get('audio_mix'):data['audio_mix']=doc['audio_mix']
     if not include_mix:data['settings']={key:value for key,value in doc['settings'].items() if key!='mute'}
     if doc.get('credit_on') is False:data['credit_on']=False
+    if doc.get('narration_id'):data['narration_id']=doc['narration_id']
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 
@@ -1230,7 +1248,7 @@ def media_graph(p, doc, source, plan, frame_filters=None):
     cfg=doc['settings']
     source_args=audio_mixer.input_args(source,SOURCE_FORMATS)
     original=doc['source'].get('audio',False)
-    mix=doc.get('audio_mix')
+    mix=doc.get('audio_mix') or doc.get('narration_id')
     if plan:
         import editing
         graph=editing.ffmpeg_filters(plan,original,cfg['mute'],video_only=bool(mix))
@@ -1242,8 +1260,35 @@ def media_graph(p, doc, source, plan, frame_filters=None):
     return source_args,graph
 
 
+def legacy_narration(p, doc, duration):
+    ident=doc['narration_id']
+    if not isinstance(ident,str) or not re.fullmatch('[a-f0-9]{32}',ident):
+        raise ValueError('기존 나레이션을 찾을 수 없습니다.')
+    with CONNECT() as con:
+        table=con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='narrations'").fetchone()
+        row=con.execute("SELECT signature,data FROM narrations WHERE id=? AND project_id=? AND status='ready'",
+                        (ident,p['id'])).fetchone() if table else None
+    cfg=doc['settings']
+    signature=hashlib.sha256(json.dumps({'script':doc['script'],'source':doc['source'],
+        'start':cfg['start'],'duration':cfg['duration']},sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+    if not row or row['signature']!=signature or doc.get('clips'):
+        raise ValueError('기존 나레이션이 현재 원본·구간·대본과 일치하지 않습니다.')
+    data=json.loads(row['data'])
+    length=data.get('duration')
+    root=(PROJECT_ROOT/p['id']).resolve()
+    path=(root/'narration'/ident/'voice.wav').resolve()
+    if not path.is_relative_to(root) or not path.is_file() or not isinstance(length,(int,float)) or not 0<length<=duration:
+        raise ValueError('기존 나레이션 파일이나 길이를 확인하세요.')
+    with path.open('rb') as stream:
+        if hashlib.file_digest(stream,'sha256').hexdigest()!=data.get('sha256'):
+            raise ValueError('기존 나레이션 파일이 변경되었습니다.')
+    return path,length
+
+
 def render_mix(p, doc, source, duration, plan, output):
     mix=doc.get('audio_mix')
+    legacy=doc.get('narration_id') and not uploaded_voice(doc)
+    if legacy and not mix:mix=audio_mixer.settings({'source_volume':0},audio_directory(p))
     if not mix:return None
     if plan:
         cuts=[(cut['source_start'],cut['source_end'],cut['duration']) for cut in plan]
@@ -1252,10 +1297,10 @@ def render_mix(p, doc, source, duration, plan, output):
     else:
         start=doc['settings']['start']
         cuts=[(start,start+duration,duration)]
-    generated=(asset(p['id'],'narration'),duration) if plan else None
+    generated=(asset(p['id'],'narration'),duration) if plan else legacy_narration(p,doc,duration) if legacy else None
     audio_mixer.render(output,source,SOURCE_FORMATS,cuts,duration,mix,
                        doc['source'].get('audio',False) and not doc['settings']['mute'],
-                       audio_directory(p),generated)
+                       audio_directory(p),generated,duck_generated_source=bool(plan))
     return output
 
 
@@ -1429,6 +1474,7 @@ def render(p):
         manifest['overlays']=doc.get('overlays',[])
         if mix:manifest['audio_mix']=doc['audio_mix']
         if uploaded_voice(doc):manifest['narration']='uploaded audio'
+        elif doc.get('narration_id'):manifest['narration']='legacy selected audio'
         if cuts:manifest['clips']=cuts
         if doc.get('quotes'):manifest['quotes']=doc['quotes']
         if voice:

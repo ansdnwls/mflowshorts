@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -19,6 +20,32 @@ class ProductionTests(unittest.TestCase):
     def tearDown(self):self.root.stop();self.db.stop();self.temp.cleanup()
     def add_source(self):
         with patch.object(production,'probe',return_value={'duration':20,'width':1920,'height':1080,'audio':True}):production.upload(self.ident,io.BytesIO(b'source'),6)
+    def test_existing_main_narration_is_checked_and_invalidated(self):
+        self.add_source()
+        production.update_project({'id': self.ident, 'script': '원래 대본'})
+        project = production.project(self.ident)
+        doc = project['document']
+        voice_id = 'b' * 32
+        doc['narration_id'] = voice_id
+        production.store(project)
+        voice = production.PROJECT_ROOT / self.ident / 'narration' / voice_id / 'voice.wav'
+        voice.parent.mkdir(parents=True)
+        voice.write_bytes(b'legacy WAV')
+        payload = {'script': doc['script'], 'source': doc['source'],
+                   'start': doc['settings']['start'], 'duration': doc['settings']['duration']}
+        signature = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        data = {'duration': 1.0, 'sha256': hashlib.sha256(voice.read_bytes()).hexdigest()}
+        with app.connect() as con:
+            con.execute('CREATE TABLE narrations (id, project_id, signature, status, data)')
+            con.execute('INSERT INTO narrations VALUES (?, ?, ?, ?, ?)',
+                        (voice_id, self.ident, signature, 'ready', json.dumps(data)))
+        self.assertEqual(production.legacy_narration(project, doc, 2), (voice.resolve(), 1.0))
+        voice.write_bytes(b'changed WAV')
+        with self.assertRaises(ValueError):
+            production.legacy_narration(project, doc, 2)
+        production.update_project({'id': self.ident, 'script': '바뀐 대본'})
+        self.assertNotIn('narration_id', production.project(self.ident)['document'])
+
     def test_approval_required_and_changes_revoke_approval(self):
         with self.assertRaises(ValueError):production.start_render(self.ident)
         self.add_source();production.update_project({'id':self.ident,'script':'사실을 확인한 새 대본'})

@@ -1,4 +1,6 @@
 import copy
+import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -35,6 +37,24 @@ class NarrationTests(unittest.TestCase):
             with self.subTest(approval=approval), self.assertRaises(ValueError):
                 narration.synthesize({**self.script, 'approved': approval}, self.folder)
         self.assertEqual(list(self.folder.iterdir()), [])
+
+    def test_openai_requires_a_key_and_measures_returned_wav(self):
+        with patch.dict(os.environ, {'MFLOW_AI_KEY': '', 'OPENAI_API_KEY': ''}):
+            with self.assertRaises(ValueError):
+                narration.configured_engine('openai')
+        wave_file = io.BytesIO()
+        with wave.open(wave_file, 'wb') as voice:
+            voice.setparams((1, 2, 24000, 0, 'NONE', 'not compressed'))
+            voice.writeframes(b'\x01\x00' * 12000)
+        responses = [io.BytesIO(wave_file.getvalue()) for _ in self.script['sentences']]
+        with patch.dict(os.environ, {'MFLOW_AI_KEY': 'fixture', 'MFLOW_TTS_MODEL': 'fixture-model'}), \
+                patch.object(narration.urllib.request, 'urlopen', side_effect=responses) as call:
+            result = narration.synthesize(self.script, self.folder, narration.configured_engine('openai'))
+        self.assertEqual([line['duration'] for line in result['segments']], [0.5, 0.5])
+        self.assertEqual(call.call_count, 2)
+        request = call.call_args_list[0].args[0]
+        self.assertEqual(request.full_url, 'https://api.openai.com/v1/audio/speech')
+        self.assertEqual(json.loads(request.data)['response_format'], 'wav')
 
     def test_actual_pcm_frame_counts_determine_sentence_timings(self):
         result = narration.synthesize(self.script, self.folder, MeasuredEngine())

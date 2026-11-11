@@ -1,11 +1,11 @@
-# mflowshorts Windows 설치·점검 스크립트
+﻿# mflowshorts Windows 설치·점검 스크립트
 #
 # 실행 (프로젝트 폴더에서):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_windows.ps1
 #   scripts\install_windows.cmd              (같은 동작, cmd에서 실행)
 #   scripts\install_windows.cmd -CheckOnly   (아무것도 설치하지 않고 상태만 확인)
 #
-# 확인 항목: Python 3.11+, Git, FFmpeg·ffprobe, 맑은 고딕 Bold, 미디어 가상환경(yt-dlp·Playwright),
+# 확인 항목: Python 3.11+ (requirements-media.lock의 multidict 7.2.1이 3.11 이상 필요), Git, FFmpeg·ffprobe, 맑은 고딕 Bold, 미디어 가상환경(yt-dlp·Playwright),
 # douyin-downloader 고정 커밋, Playwright Chromium, 한글 제목·자막 실제 렌더링(앱과 같은 ASS/libass 경로).
 # 없는 프로그램은 winget으로 현재 사용자 범위에 설치합니다. 기존 data/ 내용은 지우지 않습니다.
 [CmdletBinding()]

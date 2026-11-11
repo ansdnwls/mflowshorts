@@ -20,7 +20,7 @@ def editable(project_id):
 
 def invalidate(doc, script=False):
     doc['approved_hash'] = None
-    for key in ('narration', 'qa_report', 'output', 'archive', 'publish_approval'):
+    for key in ('narration', 'narration_id', 'qa_report', 'output', 'archive', 'publish_approval'):
         doc.pop(key, None)
     if script:
         if doc.pop('generated_script', None):
@@ -73,8 +73,12 @@ def current_script(doc):
 @production.serialized
 def generate_script(project_id, provider=None):
     p = editable(project_id)
+    script = analysis_script.generate_script(p['document'].get('analysis'), provider)
+    return apply_generated_script(p, script)
+
+
+def apply_generated_script(p, script):
     doc = p['document']
-    script = analysis_script.generate_script(doc.get('analysis'), provider)
     if len(script['text']) > 800:
         raise ValueError('생성된 대본이 800자를 넘습니다. 분석의 사실·추정 항목을 줄여주세요.')
     invalidate(doc)

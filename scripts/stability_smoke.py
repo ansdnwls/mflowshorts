@@ -167,7 +167,9 @@ def run_case(production, workflow, narration, channel, name, source, generated, 
             check('qa-report.json' in names, 'Rendered QA report missing')
             report = json.loads(archive.read('qa-report.json'))
             check(report['audio_scope'] == 'rendered_mix', 'QA did not inspect final mixed audio')
-            check(report['passed'], 'QA failed: ' + json.dumps(report['issues'], ensure_ascii=False))
+            errors = {item['code'] for item in report['issues'] if item['severity'] == 'error'}
+            check(not report['passed'] and errors == {'narration_not_audible'},
+                  'QA must reject silent narration only: ' + json.dumps(report['issues'], ensure_ascii=False))
             check('mock_audio' in {item['code'] for item in report['issues']}, 'Mock audio warning missing')
             check(manifest['narration']['mock'], 'Archive hides mock TTS status')
     measurements = []

@@ -2,7 +2,7 @@
 
 The default engine deliberately produces silence, not synthesized speech. Set
 MFLOW_TTS_ENGINE=sapi to explicitly use an installed Windows Korean SAPI voice.
-No engine in this module makes an external API call.
+OpenAI speech requires an explicit engine selection and a server API key.
 """
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 from typing import Protocol
+import urllib.error
+import urllib.request
 import wave
 
 
@@ -131,6 +133,42 @@ try {
 '''
 
 
+def openai_api_key():
+    return os.environ.get('MFLOW_AI_KEY') or os.environ.get('OPENAI_API_KEY')
+
+
+class OpenAITTS:
+    """Request WAV for each approved sentence; the caller measures the PCM."""
+
+    mock = False
+
+    def __init__(self):
+        if not openai_api_key():
+            raise ValueError('OpenAI 음성에는 서버 API 키 설정이 필요합니다.')
+        self.model = os.environ.get('MFLOW_TTS_MODEL', 'gpt-4o-mini-tts')
+        self.voice = os.environ.get('MFLOW_TTS_VOICE', 'alloy')
+        self.name = f'openai:{self.model}:{self.voice}'
+
+    def synthesize(self, text, output_path):
+        key = openai_api_key()
+        if not key:
+            raise ValueError('OpenAI 음성에는 서버 API 키 설정이 필요합니다.')
+        payload = {'model': self.model, 'voice': self.voice, 'input': text, 'response_format': 'wav'}
+        request = urllib.request.Request(
+            'https://api.openai.com/v1/audio/speech', data=json.dumps(payload, ensure_ascii=False).encode(),
+            headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'},
+        )
+        limit = 20 * 1024 * 1024
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                audio = response.read(limit + 1)
+        except (urllib.error.URLError, TimeoutError, ValueError):
+            raise ValueError('OpenAI 음성 요청에 실패했습니다. 키·할당량·네트워크 설정을 확인하세요.') from None
+        if len(audio) > limit:
+            raise ValueError('OpenAI 음성 응답이 최대 파일 크기를 초과했습니다.')
+        output_path.write_bytes(audio)
+
+
 def configured_engine(name=None) -> TTSEngine:
     name = (name if name is not None else os.environ.get('MFLOW_TTS_ENGINE', 'mock')).strip().lower()
     if name == 'mock':
@@ -139,7 +177,9 @@ def configured_engine(name=None) -> TTSEngine:
         return WindowsSAPI()
     if name == 'onecore':
         return WindowsOneCore()
-    raise ValueError('MFLOW_TTS_ENGINE은 mock, sapi, onecore 중 하나여야 합니다.')
+    if name == 'openai':
+        return OpenAITTS()
+    raise ValueError('MFLOW_TTS_ENGINE은 mock, sapi, onecore, openai 중 하나여야 합니다.')
 
 
 def script_fingerprint(script: dict) -> str:

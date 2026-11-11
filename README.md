@@ -28,6 +28,10 @@ Windows 자동 가져오기는 `scripts\install_windows.cmd`로 설치하는 미
 
 원본 업로드 → 분석 양식 생성 → 장면별 사실·추정 수정 → 분석 확정 → 대본 생성 → 대본 승인 → 나레이션 생성 → QA → 렌더 순서로 진행합니다. 분석이나 원본을 바꾸면 후속 승인을 다시 받아야 합니다.
 
+**원본 프레임·음성 검토**에서 프레임을 추출한 뒤 관찰 사실·대사·화면 글자·추정을 입력하세요. **분석 검토 저장** 후 **검토 결과를 제작 분석에 적용**을 누르면 같은 대본·음성 흐름으로 이어집니다. `MFLOW_AI_KEY` 또는 `OPENAI_API_KEY`를 서버 환경에 설정하면 화면·음성 분석과 **AI로 근거 골라 대본 만들기**를 사용할 수 있습니다. 대본은 확정된 근거만 사용하며 추정 문장에는 불확실성을 표시합니다.
+
+**발굴 → 소재 보관함**에서 성과 조건으로 영상을 모으고 사용 허락 근거와 새로운 해석을 기록합니다. 해당 소재에서 제작 프로젝트를 열면 기획 내용이 이어집니다.
+
 기본 분석·대본은 모의 제공자이며, 기본 음성은 타이밍 검증용 무음입니다. Windows에 한국어 SAPI 음성이 설치되어 있으면 PowerShell에서 `$env:MFLOW_TTS_ENGINE='sapi'`를 설정하고 앱을 시작하세요. 기본 접속 주소는 `http://127.0.0.1:8020`입니다.
 
 검증은 `python -m unittest discover -s tests -v`로 실행합니다. 실제 FFmpeg 제작 검증은 `python scripts/stability_smoke.py`로 실행하며 사용자 프로젝트와 분리된 테스트 영상을 사용합니다.
@@ -37,6 +41,8 @@ Windows 자동 가져오기는 `scripts\install_windows.cmd`로 설치하는 미
 나레이션도 같은 대기열에서 처리됩니다. 앱을 다시 실행해도 요청 시 선택한 음성 엔진으로 재시도합니다. 같은 승인 대본과 엔진으로 만든 WAV가 온전하면 기존 음성을 사용합니다.
 
 Windows의 한국어 음성 목록에 OneCore 음성이 설치되어 있으면 PowerShell에서 `$env:MFLOW_TTS_ENGINE='onecore'`를 설정하고 앱을 실행하세요. 데스크톱 SAPI 음성은 `sapi`로 선택합니다.
+
+OpenAI 음성은 API 키와 `MFLOW_TTS_ENGINE=openai`를 모두 설정했을 때 선택됩니다. 모델과 음성은 `MFLOW_TTS_MODEL`, `MFLOW_TTS_VOICE`로 지정할 수 있습니다. [OpenAI 음성 API](https://developers.openai.com/api/reference/resources/audio/subresources/speech/methods/create)
 
 실제 한국어 나레이션이 들어간 MP4를 렌더하고 최종 QA를 통과하면 **게시 준비 검토**를 진행할 수 있습니다. 영상·자막·음성을 확인하고 원본 사용 권한 근거를 기록하세요. 승인은 검수한 MP4에 저장되며 제작 내용이 바뀌면 다시 확인해야 합니다.
 
