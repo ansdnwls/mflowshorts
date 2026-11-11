@@ -208,6 +208,10 @@ def create_project(data):
         doc['credit']=credit_line(video['channel'])
         doc['context']=((note['attribution']+'\n'+note['notes']).strip() if note else '')[:2000]
         doc['source_video_id']=str(data['source_video_id'])
+        with CONNECT() as con:material=con.execute('SELECT hypothesis,angle FROM material_notes WHERE video_id=?',(doc['source_video_id'],)).fetchone()
+        if material:
+            doc['material_brief']={'hypothesis':material['hypothesis'],'angle':material['angle']}
+            doc['context']=('새 해석: '+material['angle']+'\n흥행 이유 가설: '+material['hypothesis']+'\n'+doc['context']).strip()[:2000]
     with CONNECT() as con:con.execute('INSERT INTO production_projects VALUES (?,?,?,?,?,?,?)',(ident,title,channel_id,'draft',json.dumps(doc,ensure_ascii=False),now(),now()))
     return ident
 
@@ -283,6 +287,7 @@ def fingerprint(doc):
     data={k:doc.get(k) for k in ('source','script','headline','settings')}
     data.update({k:doc[k] for k in ('credit','comments','blurs','cues') if doc.get(k)})
     if doc.get('credit_on') is False:data['credit_on']=False
+    if doc.get('narration_id'):data['narration_id']=doc['narration_id']
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 
@@ -552,6 +557,8 @@ def approve(project_id):
 def start_render(project_id):
     p=project(project_id);doc=p['document']
     if p['status'] not in ('approved','completed','error') or not doc.get('approved_hash') or doc['approved_hash']!=fingerprint(doc):raise ValueError('현재 대본과 설정을 먼저 승인하세요.')
+    from narration import for_render
+    for_render(p)
     if not state()['render_available']:raise ValueError('FFmpeg/FFprobe와 한국어 글꼴 설치가 필요합니다.')
     if not LOCK.acquire(blocking=False):raise ValueError('다른 영상이 렌더링 중입니다. 완료 후 다시 시도하세요.')
     p['status']='rendering';doc['message']='세로 영상과 제목·대본 자막을 렌더링하고 있습니다.';store(p)
@@ -709,6 +716,8 @@ def render(p):
     try:
         run.mkdir(parents=True)
         source=directory/doc['source']['filename'];cfg=doc['settings'];duration=min(cfg['duration'],doc['source']['duration']-cfg['start'])
+        from narration import for_render,timing
+        voice=for_render(p)
         style=STYLES[cfg['style']]
         vf=layout_filters(cfg.get('layout','fill'))
         if cfg['mirror']:vf.append('hflip')
@@ -738,17 +747,21 @@ def render(p):
         (run/'captions.srt').write_text(srt,encoding='utf-8')
         output=run/'short.mp4'
         audio=1 if letters or ai else 0
-        command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args,'-t',str(duration),'-map','0:v:0']
-        if not cfg['mute']:command+=['-map',f'{audio}:a:0?']
+        command=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-y','-threads','2',*source_args]
+        if voice:command+=['-protocol_whitelist','file','-i',str(voice[0])]
+        command+=['-t',str(duration),'-map','0:v:0']
+        if voice:command+=['-map',f'{audio+1}:a:0','-af','apad']
+        elif not cfg['mute']:command+=['-map',f'{audio}:a:0?']
         command+=['-vf',','.join(vf),'-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',str(output)]
         subprocess.run(command,capture_output=True,timeout=480,check=True)
         result=probe(output)
         if result['width']!=WIDTH or result['height']!=HEIGHT:raise ValueError('render size')
-        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':'manual timeline' if doc.get('cues') else 'equal segments; not speech aligned','narration':'original audio only; no synthetic voice','blurs':doc.get('blurs') or [],'approved_hash':doc['approved_hash']}
+        manifest={'version':1,'title':p['title'],'headline':doc['headline'],'script':doc['script'],'settings':cfg,'source_url':doc.get('source_url',''),'context':doc.get('context',''),'duration':duration,'caption_timing':timing(p,voice[1]) if voice else ('manual timeline' if doc.get('cues') else 'equal segments; not speech aligned'),'narration':({'id':voice[1]['id'],'mode':voice[1]['mode'],'timing':voice[1]['data']['timing'],'duration':voice[1]['data']['duration']} if voice else 'original audio or mute'),'blurs':doc.get('blurs') or [],'approved_hash':doc['approved_hash']}
         (run/'project.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
         with zipfile.ZipFile(run/'project.zip','w',compression=zipfile.ZIP_STORED) as archive:
             for name in ('short.mp4','captions.srt','project.json'):archive.write(run/name,name)
-        doc.update({'output':str(output.relative_to(directory)),'archive':str((run/'project.zip').relative_to(directory)),'message':'MP4와 자막·프로젝트 설정 묶음 제작이 완료되었습니다. 원음 유지 방식이며 합성 음성은 없습니다.','render_info':result})
+            if voice:archive.write(voice[0],'narration.wav')
+        doc.update({'output':str(output.relative_to(directory)),'archive':str((run/'project.zip').relative_to(directory)),'message':'MP4와 자막·프로젝트 설정 묶음 제작이 완료되었습니다. 선택한 원음·무음·내레이션 설정이 적용됐습니다.','render_info':result})
         shutil.rmtree(fonts,ignore_errors=True)
         p['status']='completed';store(p)
     except Exception as exc:
